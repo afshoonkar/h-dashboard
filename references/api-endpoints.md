@@ -11,19 +11,19 @@ Scheduled tasks are registered in `bootstrap/app.php` via `->withSchedule(...)` 
 | Command | Schedule | Class | Purpose |
 |---|---|---|---|
 | `cache:prune-stale` | hourly | `PruneStaleCache` | Resets all cache version counters (see **Cache Version Namespaces**) so stale versioned keys expire |
-| `todos:generate-recurring` | daily 02:00 | `GenerateRecurringTodos` | Creates recurring todo instances from `todos.recurrence_rule` templates |
-| `maintenance:generate-due` | daily 03:00 | `GenerateDueMaintenance` | Generates due maintenance tickets from `maintenance_schedules` |
-| `data:archive` | weekly (Mon 04:00) | `ArchiveOldRecords` | Moves old `activity_logs` (>12 months) into `activity_log_archives` |
+| `todos:generate-recurring` | daily 02:00, `->withoutOverlapping(60)` | `GenerateRecurringTodos` | Creates recurring todo instances from `todos.recurrence_rule` templates |
+| `maintenance:generate-due` | daily 03:00, `->withoutOverlapping(60)` | `GenerateDueMaintenance` | Generates due maintenance tickets from `maintenance_schedules` |
+| `data:archive` | weekly (Mon 04:00), `->withoutOverlapping(120)` + in-command lock | `ArchiveOldRecords` | Moves old `activity_logs` (>12 months) into `activity_log_archives` |
 | `reports:generate-daily` | daily 06:00 | `GenerateDailyReports` | Builds `daily_reports` rows per unit, org-wide (no actor at 06:00 — see #836) |
 | `SyncZabbixJob` (**queued job**, not a command) | every 5 min | `App\Jobs\SyncZabbixJob` | Pulls Zabbix interface traffic, caches `zabbix_traffic_data` for 5 min |
 
-> `zabbix:sync` (`SyncZabbix`) still exists as a **manual** command but is **no longer scheduled** (plan 018, 2026-09-24): the schedule dispatches `SyncZabbixJob` with `->withoutOverlapping()`, so a slow Zabbix API can never block the scheduler. The job has `timeout = 30`, `tries = 2`, a `failed()` logger, and skips itself when `services.zabbix.out_item_id`/`in_item_id` are unset.
+> `zabbix:sync` (`SyncZabbix`) still exists as a **manual** command but is **no longer scheduled** (plan 018, 2026-09-24): the schedule dispatches `SyncZabbixJob` with `->withoutOverlapping()`, so a slow Zabbix API can never block the scheduler. The job has `timeout = 30`, `tries = 2`, a `failed()` logger for queue-level failures, records a failure row when a fetch returns a failed result as well as when item IDs are unset, and skips itself when `services.zabbix.out_item_id`/`in_item_id` are unset.
 
 **Implemented-command details (was placeholder before 2026-08-29):**
 
 - `todos:generate-recurring` — reads `todos` where `recurrence_rule != 'none'` and `last_generated_at <= now()`. For each due template it creates a fresh instance (`recurrence_rule = 'none'`) and advances `last_generated_at` to `nextOccurrence()` (`daily`/`weekly`/`monthly` × `recurrence_interval`, based on `last_generated_at ?? start_at`). Recurrence fields added in `2026_08_29_000002_add_recurrence_fields_to_todos_table.php`.
 - `maintenance:generate-due` — reads `maintenance_schedules` where `next_due_at <= now()` (or null), creates a `Ticket` (`ticket_code = 'T-'.Str::random(8)`, `status = 'created'`) on the schedule's `unit_id`, then advances `last_generated_at` and `next_due_at` by the schedule frequency.
-- `data:archive` — chunks `activity_logs` older than `--months=12` (default), copies them to `activity_log_archives` (preserving `original_created_at`/`original_updated_at`) and deletes the originals. Supports `--dry-run`.
+- `data:archive` — chunks `activity_logs` older than `--months=12` (default), copies them to `activity_log_archives` (preserving `original_created_at`/`original_updated_at`) and deletes the originals. Supports `--dry-run`. Since #1305 it holds `Cache::lock('command:data:archive', 6h)` for the whole run: the schedule's `withoutOverlapping(120)` is only read on the `Schedule::run()` path, so a manual run would otherwise race a scheduled one and archive the same rows twice. A run that cannot take the lock warns, logs, and exits 0. Emergency manual runs release it with `Cache::lock('command:data:archive', 1)->forceRelease()` — there is deliberately no `--force` flag.
 - `reports:generate-daily` — iterates `AccessService::allUnitIds()` (or `--unit=N`) and upserts a `daily_reports` row for today with open-ticket/open-todo counts. Supports `--dry-run`. **Org-wide by default, not actor-scoped** (#836): the 06:00 schedule runs with no authenticated user, so `accessibleUnitIds()` would be `[]` and the command would write nothing. `--unit=N` scopes a manual single-unit run.
 
 > All four take a `--dry-run` flag (or `--unit` for reports) so CI/ops can preview without side effects.
@@ -36,7 +36,7 @@ Other commands: `NormalizePersianText` (one-off Persian normalization), plus the
 
 ## API Reference
 
-All `/api/*` routes require `auth:sanctum` (Bearer token) **and a token ability** (issue #690) and filter by the user's organizational scope. Token route: `POST /api/login` (`n_code` + `password`, throttled). Session route: `POST /api/logout` returns `204`, requires `auth:sanctum` but **no ability** (like `/api/user` — a self-scoped action, #1071), and revokes **only the caller's current token** — other devices stay signed in, and reusing the revoked token is `401`.
+All `/api/*` routes require `auth:sanctum` (Bearer token) **and a token ability** (issue #690) and filter by the user's organizational scope — **except three intentional exemptions**: `POST /api/login` is public (it mints the token; no `auth:sanctum`, no ability), and `GET /api/user` plus `POST /api/logout` require `auth:sanctum` but **no ability** because they are self-scoped (logout by #1071, following the pre-existing `/api/user` precedent). Token route: `POST /api/login` (`n_code` + `password`, throttled). Session route: `POST /api/logout` returns `204`, requires `auth:sanctum` but **no ability** (like `/api/user` — a self-scoped action, #1071), and revokes **only the caller's current token** — other devices stay signed in, and reusing the revoked token is `401`.
 
 **Abilities:** read groups use `ability:*` (Sanctum: ANY of the listed abilities), write groups use `abilities:*` (ALL) — `units:read|write`, `traffic:read`, `hardware:read|write`, `tickets:read|write`, `reports:read`, `persons:read|write`, `todos:read|todos:write`, `hr:read`, `notifications:read`, `gis:read`. Several write groups *also* require a Spatie `role_or_permission` (`organization`, `manage_hardware`, `manage_personnel`, `calendar`, `view_hr_dashboard`, `map`) — both must pass. The full per-route table lives in **AGENTS.md → "API Token Abilities"**; tokens are scoped and revoked on password change (#678), and API tests mint real Bearer tokens (`tests/Feature/ApiAbilityTest.php`).
 
@@ -252,14 +252,11 @@ All scoped via `AccessService::accessibleUnitIds()`. Web pages: `/hr-dashboard` 
 
 `zabbix_sync_logs` — one row per `SyncZabbixJob` run (migration `2026_09_30_000002_create_zabbix_sync_logs_table.php`), model `App\Models\ZabbixSyncLog`.
 
-- Columns: `success`, `consecutive_failures`, `error`, `ran_at` (indexed). `consecutive_failures` is **precomputed including the current row** (0 on a success row) so the threshold check and the dashboard widget are single-row reads.
-- `failed()` runs **only after the queue exhausts its tries**, so one job failure produces exactly one row — retries do not inflate the streak. It also calls `report($exception)` alongside `Log::error()`, so a dead log channel still records the failure.
+- Columns: `success`, `error`, `ran_at` (indexed).
+- `failed()` runs **only after the queue exhausts its tries**, so one job failure produces exactly one row — retries do not produce extra failure rows. It also calls `report($exception)` alongside `Log::error()`, so a dead log channel still records the failure.
 - **A missing item-id configuration is now a recorded failure**, not a warning nobody reads: with `services.zabbix.out_item_id`/`in_item_id` unset the job writes a failure row (before #740 a misconfigured deployment stayed silently broken for weeks).
-- At streak **exactly** `ZabbixSyncLog::ALERT_THRESHOLD` (= 3) it notifies **every admin user once** through `NotificationService::send()` — in-app only, no new email/webhook infrastructure. Further failures stay visible on the dashboard without re-firing; any success resets the streak to 0.
-- **Dashboard banner:** `getZabbixSyncStatusProperty()` reads the **latest row only** and renders `ok` / `stale` (last run old) / `failing` (streak), distinguishing «نمایش از کش قدیمی» from «داده ترافیک در دسترس نیست».
+- **Dashboard banner:** `getZabbixSyncStatusProperty()` reads the **latest row only** and renders `ok` / `stale` (last run old) / `failing` (last run failed), distinguishing «نمایش از کش قدیمی» from «داده ترافیک در دسترس نیست».
 - Tests: `tests/Feature/SyncZabbixObservabilityTest.php`.
-
-> The streak is derived by reading the previous row (`orderByDesc('id')->first()`), so run recording is **serial by nature** — parallelising it would let two runs compute the same streak value.
 
 ### GIS Disease Layer (issue #1245)
 
@@ -503,7 +500,7 @@ DB_ROOT_PASSWORD=...       # docker postgres superuser
 DB_DEFAULT_EMAIL=...       # seeded admin email
 DB_DEFAULT_PASSWORD=...    # seeded admin password
 
-CACHE_DRIVER=redis
+CACHE_STORE=redis
 SESSION_DRIVER=redis
 QUEUE_CONNECTION=redis
 REDIS_HOST=127.0.0.1
@@ -512,8 +509,7 @@ REDIS_PASSWORD=123
 
 ZABBIX_URL=http://127.0.0.1:8443/api_jsonrpc.php
 ZABBIX_TOKEN=...
-# Map tiles: only TILE_URL_TEMPLATE has any effect. TILE_SERVER_IP / TILE_SERVER_PORT /
-# TILE_SERVER_SCHEME are reserved — they build map.tile_url, which nothing consumes.
+# Map tiles: only TILE_URL_TEMPLATE has any effect (TILE_SERVER_* were retired in #1508).
 TILE_URL_TEMPLATE=https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png
 ```
 
@@ -530,7 +526,7 @@ php artisan db:seed --force
 
 Pest is the test runner (`vendor/bin/pest`). The suite uses **Livewire 4.4**, which hashes the update endpoint based on `APP_KEY` (`livewire-{hash}/update`), and `phpunit.xml` expects a **separate PostgreSQL test database** named `h_dashboard_test` (DB name is hard-coded; `DB_USERNAME`/`DB_PASSWORD` are NOT set in phpunit.xml, so they fall back to `.env` and the local run uses the `h_dashboard` role). The suite is **hermetic** — no Redis dependency (see step 3). Getting the environment right is the most common failure mode — follow these steps exactly.
 
-> **✅ Verified 2026-10-01:** **`composer test`** is the one-command way to run the full suite (**1687 passed, 2 risky, 4268 assertions**, ~289s serial). It bakes in the three environment gotchas discovered 2026-08-26: config/route cache clear (Livewire endpoint-hash mismatch) and `XDEBUG_MODE=off` (see failure table — Xdebug develop mode breaks `after_or_equal:date` validation).
+> **✅ Full-suite figure:** the canonical stamp lives in [`docs/agents/testing.md`](../docs/agents/testing.md) → "Latest full-suite figure" — one source of truth, re-derived there with `composer test` (#983). The 2026-10-01 figure (1687 passed, 2 risky, 4268 assertions) is retired and must not be re-stamped here. **`composer test`** is the one-command way to run the full suite. It bakes in the three environment gotchas discovered 2026-08-26: config/route cache clear (Livewire endpoint-hash mismatch) and `XDEBUG_MODE=off` (see failure table — Xdebug develop mode breaks `after_or_equal:date` validation).
 
 #### 1. Prerequisites (services must be up)
 ```bash
@@ -586,7 +582,7 @@ php artisan config:clear && php artisan route:clear && XDEBUG_MODE=off php artis
 - **Why `XDEBUG_MODE=off`:** Xdebug loads in `develop` mode; when Laravel's date validation (`after_or_equal:start_at` etc.) throws its *expected* parse exception, Xdebug tries to attach a `$xdebug_message` dynamic property to `DateMalformedStringException`, PHP 8.3 turns that into an `Error`, and it escapes Laravel's `catch (Exception)` → HTTP 500. Symptom: `Failed to parse time string (start_at) … timezone could not be found in the database` plus `Cannot create dynamic property DateMalformedStringException::$xdebug_message`. Not a code bug — env only.
 - **No pcov needed for normal runs** — `phpunit.xml` deliberately has **no `<coverage>` block** (see failure table below). Request coverage explicitly when you want it: `./vendor/bin/pest --parallel --coverage --min=80 --coverage-clover=coverage.xml` (what CI runs, with pcov installed).
 - **`php artisan test` works with no path** — the old `vendor/bin/pest tests/` caveat is gone (phpunit.xml has `<testsuites>`).
-- Expected: **1687 passed, 2 risky** (0 skipped) — `risky` = tests with no assertions (non-blocking).
+- Expected: a green suite with **no `risky` rows** — `failOnRisky="true"` in `phpunit.xml` fails the run on any test that performs no assertions. Current counts live in the stamp in [`docs/agents/testing.md`](../docs/agents/testing.md) → "Latest full-suite figure".
 
 #### Common failure → cause
 
@@ -603,7 +599,7 @@ php artisan config:clear && php artisan route:clear && XDEBUG_MODE=off php artis
 
 ### E2E Testing (Playwright)
 
-**~165 tests** across **40 spec files** in `tests/e2e/` (static counts re-checked 2026-10-01; not verified by a run — no browser/.env.e2e on that machine). Full setup, credentials, and failure table: **AGENTS.md → "E2E Testing (Playwright)"**. Essentials:
+**64 spec files** in `tests/e2e/` (`find tests/e2e -name '*.spec.ts' | wc -l`, on `beta @ 7325b6ec`, 2026-11-14). No absolute test count is recorded here: `npx playwright test --list` needs a live e2e env, and a static `test(` grep undercounts loop-generated suites — run the suite to get the figure. Full setup, credentials, and failure table: **AGENTS.md → "E2E Testing (Playwright)"**. Essentials:
 
 - Always run through the lifecycle script: `bash scripts/e2e-test.sh [optional spec paths]` — swaps `.env` ← `.env.e2e`, `config:clear` + `route:clear`, `migrate:fresh --seed` on `h_dashboard_e2e`, creates the password-mutation user, serves on `:8001`, runs Playwright, restores `.env`.
 - **`.env.e2e` is gitignored — generate it locally with `bash scripts/build-env-e2e.sh`** (issue #703), which copies `APP_KEY` / `DB_PASSWORD` / `REDIS_PASSWORD` out of `.env` into a copy of `.env.e2e.example` **without printing the values** (the terminal masks secrets, so a read-and-rewrite would write a literal `***` into the file). Fill `DB_USERNAME` yourself. It **must** carry `APP_LOCALE=fa` — `.env.e2e.example` **does** include it now (`7485043`), but a hand-written copy from an older example does not, and `config/app.php` falls back to `en`, failing **11 Persian-text specs** (`Showing 1 to 20 of 318 results`, English validation messages instead of `نمایش…` / `باید مطابقت داشته باشند`).
@@ -640,23 +636,17 @@ codegraph status .
 
 ### CI/CD
 
-`.github/workflows/test.yml` runs on PRs to `main`/`beta`/`test`; three of its jobs are blocking and the rest are informational (`mutation` no longer runs on PRs — manual `workflow_dispatch` only, #1012):
-
-| Job key | Name | Gate | Timeout |
-|---|---|---|---|
-| `lint` | Code Style (Pint) | **blocking** | 5 min |
-| `test` | Tests & Coverage | **blocking** | 10 min |
-| `phpstan` | PHPStan Static Analysis | **blocking** | 10 min |
-| `coverage-report` | Coverage Report (Blade-aware, informational) | `continue-on-error: true` | 10 min |
-| `e2e` | E2E Tests (Playwright) | `continue-on-error: true` | 30 min |
-| `mutation` | Mutation Testing | `continue-on-error: true`; manual-only (`workflow_dispatch`, #1012) | 30 min |
-| `test-php86` | PHP 8.6 Preview | `continue-on-error: true` | 10 min |
+`.github/workflows/test.yml` runs on PRs to `main`/`beta`/`test` with a mix of
+blocking jobs and informational ones (`continue-on-error: true`). The canonical
+job table (keys, display names, gates), its per-job detail and both `yq`
+derivations live in **`docs/agents/testing.md` → "CI jobs"**, which is the single
+source of truth — do not restate the job list or its counts here. Blocking is not
+PHP-only: read the gates before assuming a red CI check does not block a merge
+(this section's former table under-reported four blocking jobs until #1479).
 
 - **`lint`** — `vendor/bin/pint --test` plus the tracked-`APP_KEY` guard (`php scripts/check-app-key-leak.php`).
-- **`test`** — PHP 8.5, PostGIS + Redis containers, builds frontend (`npm ci && npm run build`), rewrites `.env.testing` to match containers (`postgres/secret/h_dashboard_test`, **`CACHE_STORE=array`**), `key:generate --env=testing`, `migrate --env=testing`, clears config/routes/views, then `./vendor/bin/pest --parallel --coverage --min=80 --coverage-clover=coverage.xml` → Codecov, followed by two assertions that the suite really ran (a non-zero `Tests:` summary and no test file reporting zero tests).
-- **`mutation`** — `--covered-only`, treat failures as informational. Gated to manual `workflow_dispatch` (#1012): it never runs on a PR.
-
-> Derivation, re-run instead of hand-counting — `yq -r '.jobs | keys | join(", ")' .github/workflows/test.yml` → `lint, test, coverage-report, e2e, mutation, phpstan, test-php86`, and the blocking set is `yq -r '.jobs | to_entries | map(select(.value."continue-on-error" != true) | .key) | join(", ")' .github/workflows/test.yml` → `lint, test, phpstan`.
+- **`test`** — PHP 8.5, PostGIS + Redis containers, rewrites `.env.testing` to match containers (`postgres/secret/h_dashboard_test`, **`CACHE_STORE=array`**), `key:generate --env=testing`, `migrate --env=testing`, clears config/routes/views, then `./vendor/bin/pest --parallel --coverage --min=80 --coverage-clover=coverage.xml` → Codecov, followed by two assertions that the suite really ran (a non-zero `Tests:` summary and no test file reporting zero tests).
+- **`mutation`** — `--covered-only`, `--min=41`, Composer-only (no Node/Vite build), runs on every PR; the score threshold makes it blocking since #1502, while still running in parallel with E2E. `timeout-minutes: 45` is a cap, not the expected duration (~30 min typical).
 
 ### Storage Permissions (gotcha)
 

@@ -2,17 +2,20 @@
 
 namespace App\Providers;
 
+use App\Models\ActivityLog;
 use App\Models\Boundary;
 use App\Models\Disease;
 use App\Models\DiseaseCase;
 use App\Models\DiseaseFieldDef;
 use App\Models\Hardware;
 use App\Models\Patient;
+use App\Models\Person;
 use App\Models\Region;
 use App\Models\Ticket;
 use App\Models\Todo;
 use App\Models\Unit;
 use App\Models\UnitPopulation;
+use App\Models\User;
 use App\Observers\HardwareAuditObserver;
 use App\Services\AccessService;
 use App\Services\CacheInvalidationService;
@@ -22,7 +25,12 @@ use App\Services\Zabbix\ZabbixClient;
 use App\Services\ZabbixService;
 use App\Support\VendorRouteGuard;
 use App\View\Components\AccessibleMenuItem;
-use App\View\Components\AccessibleTable;
+use App\View\Components\CspChoicesOffline;
+use App\View\Components\CspFile;
+use App\View\Components\CspMain;
+use App\View\Components\CspMenuSub;
+use App\View\Components\CspModal;
+use App\View\Components\CspTable;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Routing\Router;
@@ -73,7 +81,7 @@ class AppServiceProvider extends ServiceProvider
         // `tabindex`, and it is built inside the vendor component's own render()
         // heredoc — no call-site attribute can reach it. Re-registering the
         // alias is the only faithful fix; `<x-table>` keeps working unchanged
-        // because AccessibleTable extends Mary's Table.
+        // because CspTable extends Mary's Table through AccessibleTable.
         //
         // #957 (step 2, second half): the sidebar marks the current page with a
         // CSS class only, so a screen reader reports no location at all.
@@ -87,8 +95,18 @@ class AppServiceProvider extends ServiceProvider
         // Deploys must run `view:clear` before `view:cache` — Blade keys a
         // compiled view on the source file's mtime, not on the alias table, so
         // a cache carried over from before this change keeps Mary's markup.
-        Blade::component('table', AccessibleTable::class);
+        Blade::component('table', CspTable::class);
         Blade::component('menu-item', AccessibleMenuItem::class);
+
+        // CSP-compat overrides (#1352): app-owned MaryUI components whose
+        // x-data literals the CSP-safe Alpine build cannot evaluate.
+        // CspTable replaces the AccessibleTable alias and inherits its
+        // ariaSort() — see each class docblock for the exact diff.
+        Blade::component('main', CspMain::class);
+        Blade::component('menu-sub', CspMenuSub::class);
+        Blade::component('modal', CspModal::class);
+        Blade::component('choices-offline', CspChoicesOffline::class);
+        Blade::component('file', CspFile::class);
 
         // Register help-content components dynamically with colon syntax
         $helpContents = [
@@ -138,7 +156,7 @@ class AppServiceProvider extends ServiceProvider
         Todo::updated(fn () => $invalidate($todoNamespaces));
         Todo::deleted(fn () => $invalidate($todoNamespaces));
 
-        $ticketNamespaces = ['report_tickets', 'gis', 'calendar', 'dashboard'];
+        $ticketNamespaces = ['report_tickets', 'gis', 'calendar', 'dashboard', 'tools_stats'];
         Ticket::created(fn () => $invalidate($ticketNamespaces));
         Ticket::updated(fn () => $invalidate($ticketNamespaces));
         Ticket::deleted(fn () => $invalidate($ticketNamespaces));
@@ -151,9 +169,27 @@ class AppServiceProvider extends ServiceProvider
         Unit::updated(fn () => $invalidate($unitNamespaces));
         Unit::deleted(fn () => $invalidate($unitNamespaces));
 
+        // Issue #1348: the activity-log page caches its accessible-user list
+        // and type counts under `activity_log`, and the tools page caches its
+        // counts under `tools_stats`. User creation/deletion, a Person moving
+        // units (or being created/deleted), and any ActivityLog write must
+        // bump them. This wiring lives here — beside the Ticket/Unit wiring —
+        // so Person.php stays untouched for #1347. Known gap, accepted with
+        // the 5-minute TTL bound: user↔unit pivot syncs in Blade
+        // (users/index, kargozini/person) fire no model event.
+        User::created(fn () => $invalidate(['activity_log']));
+        User::deleted(fn () => $invalidate(['activity_log']));
+        Person::saved(function (Person $model) use ($invalidate): void {
+            if ($model->wasChanged('u_id') || $model->wasRecentlyCreated) {
+                $invalidate(['activity_log']);
+            }
+        });
+        Person::deleted(fn () => $invalidate(['activity_log']));
+        ActivityLog::created(fn () => $invalidate(['activity_log', 'tools_stats']));
+
         // Issue #1245: every disease-domain write invalidates the map layer.
         // Bulk `DB::table()` updates fire no model event — documented in
-        // docs/agents/features.md as the known limit of this hook.
+        // references/api-endpoints.md as the known limit of this hook.
         $diseaseNamespaces = ['disease_maps'];
 
         /** @var list<class-string<Model>> $diseaseModels */

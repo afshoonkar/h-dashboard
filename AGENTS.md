@@ -17,7 +17,7 @@ Health Dashboard is a Laravel 13.x application for managing hospital/healthcare 
 ### Tech Stack
 
 - **Framework:** Laravel 13.x on PHP ^8.4 (CI runs 8.5; Symfony 8.1 requires ≥8.4)
-- **PHP 8.6 preview:** blocked by three locked packages that cap `require.php` at 8.5 — `nette/schema` and `nette/utils` (production path, via league/commonmark) and `brianium/paratest` (dev); the `test-php86` job installs with `--ignore-platform-req=php`.
+- **PHP 8.6 preview:** only `brianium/paratest` v7.20.0 (`~8.3.0 || ~8.4.0 || ~8.5.0`, dev) still caps `require.php` below 8.6, so `test-php86` installs with `--ignore-platform-req=php`. The nette production pair left the set with the #1506 lock refresh: `nette/schema` v1.4.0 (`8.1 - 8.6`) and `nette/utils` v4.1.6 (`8.2 - 8.6`), pulled in by `league/commonmark` → `league/config` → `nette/schema` → `nette/utils`, and both allow 8.6 inside today's `^1.2`/`^4.0`. Upstream isn't blocking 8.6: `brianium/paratest` ≥7.25.0 (`~8.4.0 || ~8.5.0 || ~8.6.0`) requires `phpunit ^13` (pest 5) — that test-stack major is the long pole.
 - **Frontend:** Livewire 4 — **single-file (anonymous-class) components**: the PHP class lives inline at the top of its Blade view under `resources/views/livewire/<feature>/<name>.blade.php` as `return new class extends Component { ... };` (no separate file under `app/Livewire/`). Alpine.js, MaryUI (DaisyUI), Tailwind CSS 4
 - **Database:** PostgreSQL 16 (Docker, `postgis/postgis:16-3.4`) with PostGIS for spatial/GIS data
 - **Cache/Session/Queue:** Redis (Docker, `redis:latest`, password-protected via `REDIS_PASSWORD`)
@@ -25,8 +25,6 @@ Health Dashboard is a Laravel 13.x application for managing hospital/healthcare 
 - **Package Manager:** Composer (backend); npm (frontend): `npm install` + `npm run build` / `vite build` (Node 24, npm 12)
 - **E2E Testing:** Playwright (Chromium, `tests/e2e/`, `npx playwright test`)
 - **Code Quality:** PHPStan level 6 with baseline, Laravel Pint (enforced in CI + pre-commit hook)
-
-> **Detailed data model & relationships:** `references/data-model.md` — API endpoints, scheduler, deployment, performance: `references/api-endpoints.md`
 
 ---
 
@@ -54,9 +52,9 @@ Each line is the whole rule; the link holds the detail and the evidence.
 - **Sidebar link ↔ route gate must carry the same permissions** (`SidebarPermissionsTest` pins both directions). `role_or_permission` syntax is `a|b` = ANY — **not** Sanctum's comma form. Nested `middleware(['a','b'])` and nested permission groups are **AND**, not OR. → [access-control](docs/agents/access-control.md)
 - **Spatie `canAny()` returns `false` for an unknown permission name** — a gate on a permission missing from a deployment's DB silently 403s every non-admin. Before adding a *new* permission to a gate, seed it everywhere or reuse an existing one. → [access-control](docs/agents/access-control.md)
 - **A page on a read-union gate that also writes must authorize inside the component** (`$this->authorize('…')`), not only at the route — and must re-validate the *submitted* unit id, not just the stored one. → [access-control](docs/agents/access-control.md)
-- **`/api/*` needs `auth:sanctum` *and* a token ability** (`ability:a,b` = ANY, `abilities:a,b` = ALL); reads and writes are independent groups (#895); tokens are scoped and revoked on password change. → [api-auth](docs/agents/api-auth.md)
+- **`/api/*` needs `auth:sanctum` *and* a token ability** (`ability:a,b` = ANY, `abilities:a,b` = ALL); reads and writes are independent groups (#895); tokens are scoped and revoked on password change. Three intentional exemptions: `POST /login` (public — it mints the token), plus the self-scoped `GET /user` and `POST /logout` that act on the caller, not a resource — logout by #1071, following the pre-existing `/user` precedent. → [api-auth](docs/agents/api-auth.md)
 - **Disease map aggregates are PII-free by construction** — the three `GET /api/gis/disease*` endpoints ride the `gis` gate (`gis:read` + `map|bw`) and return counts/rates only, never patient identifiers, names or dynamic field values; no `manage_diseases` requirement. → [api-auth](docs/agents/api-auth.md)
-- **Controllers depend on `ZabbixClient`, never `ZabbixService`.** A failed `ZabbixResult` maps to **503**; the `catch (\Throwable)` wrapper is gone — do not restore it. The `ZabbixSyncLog` failure streak is serial — never parallelise run recording. → [zabbix](docs/agents/zabbix.md)
+- **Controllers, queued jobs and console commands depend on `ZabbixClient`, never `ZabbixService`.** Controllers map a failed `ZabbixResult` to **503**; `SyncZabbixJob` records a failure row; `zabbix:sync` exits 1. → [zabbix](docs/agents/zabbix.md)
 - **The Leaflet instance is owned by `Alpine.store('map')`** — never `window.map`, never a "wait until a map exists" loop, never a Leaflet instance in Alpine reactive state. `maps/map.blade.php` is the only place allowed to call `L.map()`. → [maps](docs/agents/maps.md)
 - **`units.boundary_id` is `ON DELETE CASCADE`** — null it out (`$unit->update(['boundary_id' => null])`) **before** deleting the boundary row, or the unit and its subtree vanish (#702). `Boundary::geojson` is a **bare geometry** (no `Feature`, and MultiPolygon must be unwrapped) or `fitBounds` throws. → [maps](docs/agents/maps.md)
 - **The disease map layer is read-only and two-group** — it consumes `/api/gis/disease-map` GeoJSON plus the server's `class`/`meta.breaks`, and lives in `diseaseRegions`/`diseaseUnits` panes at `ZOOM_SWITCH=9`; never copy the `units/map` edit flow (`Boundary::geojson`, `_mapGeojson`, `saveMapBoundary`). → [maps](docs/agents/maps.md)
@@ -65,7 +63,7 @@ Each line is the whole rule; the link holds the detail and the evidence.
 - **By-day charts use `DailySeries`** (`generate_series` + left-join the caller's own filtered query — fills empty days, keeps the picked range), and `['days' => $days]` belongs in the **cache key**. → [features](docs/agents/features.md)
 - **Ticket archiving is a timestamp, never a status** — `status = 'completed'` + `archived_at` stamped, one-way (#929). → [features](docs/agents/features.md)
 - **Never write children onto a model in a tree build** — `$unit->children` is a real `hasMany` relation; accumulate into a `$childrenByParent` map keyed by parent id and never read the relation (#933). → [features](docs/agents/features.md)
-- **Persian search folds the COLUMN, not just the term.** Term: `normalizeForSearch()` once, `foldedTerm($input)` per term. Column: `foldSeparatorsSql($col)` for lookup-table columns (no save hook). A second folded list indexed by the raw term positions walks off the end (#940). `normalizeForQuery()` only for columns the model normalizes on save. → [search](docs/agents/search.md)
+- **Persian search folds the COLUMN in a stored generated column, never at query time.** `*_folded` on persons/units/semats (`GENERATED STORED`, `gin_trgm`) (#1482). Term: `normalizeForSearch()` once, `foldedTerm()` per term; a second list indexed by raw positions walks off the end (#940). `normalizeForQuery()` only for hook-normalized columns. → [search](docs/agents/search.md)
 - **Every `$x->user` in a view is nullable** (`SoftDeletes` keeps the row and resolves `null`) — labels via `App\Support\ActorLabel` («سیستم» / «کاربر غیرفعال»). → [features](docs/agents/features.md)
 - **`NotificationService::send()` is the static primitive** (creates the row, invalidates the bell cache); `SendNotificationJob` is only its queued per-recipient wrapper and has no `send()` of its own. → [features](docs/agents/features.md)
 - **The schedule lives in `bootstrap/app.php` (`->withSchedule(...)`)** — `app/Console/Kernel.php` was never bound and is deleted. `SyncZabbixJob` every 5 min (not the `zabbix:sync` command, which is manual-only). No `->timeout(N)` on schedule entries — throws `BadMethodCallException`. → [features](docs/agents/features.md)
@@ -75,6 +73,7 @@ Each line is the whole rule; the link holds the detail and the evidence.
 - **A tracked env file carries no real `APP_KEY` (#953)** and the gitignored working `.env` **must** have one. `composer verify` fails fast if `.env` is missing — deliberate, not a bug. → [testing](docs/agents/testing.md)
 - **E2E only via `scripts/e2e-test.sh`** (swaps `.env`, fresh DB, `:8001`) and `.env.e2e` **must** set `APP_LOCALE=fa` — without it 11 Persian-text specs fail. Never point e2e at `h_dashboard`; the e2e DB is wiped every run. → [e2e](docs/agents/e2e.md)
 - **No external runtime load (script/style/font/tile/iframe/fetch) without a row in `docs/agents/offline.md`; local by default.** → [offline](docs/agents/offline.md)
+- **Every `Blade::component()` alias to `App\View\Components` and every render heredoc needs a `MaryUiMirrorTest` contract, or the suite fails** — `NON_MIRRORS` declares the app-owned exceptions. → [features](docs/agents/features.md)
 
 ---
 
@@ -89,17 +88,19 @@ Each line is the whole rule; the link holds the detail and the evidence.
 - **Modal:** `x-modal` with `close-on-backdrop`
 - **Testing:** Pest — `tests/Feature/*`, run via **`composer test`**
 - **Test Review Rule:** Every code change MUST include test review. Before finalizing: (1) check if existing tests cover the changed code, (2) add/update tests for new behavior, bug fixes, or contract changes. No code change ships without corresponding test coverage verification.
-- **Factories:** 15 factories exist under `database/factories/` — `Ticket` DOES use `HasFactory`, so `Ticket::factory()` works (the old "no `HasFactory`" gotcha was wrong, #983 — see [testing](docs/agents/testing.md)); `created_at` is not fillable — back-date with `forceFill([...])->saveQuietly()`.
+- **Factories:** 18 factories exist under `database/factories/` — `Ticket` DOES use `HasFactory`, so `Ticket::factory()` works (the old "no `HasFactory`" gotcha was wrong, #983 — see [testing](docs/agents/testing.md)); `created_at` is not fillable — back-date with `forceFill([...])->saveQuietly()`.
 - **Formatting:** run `vendor/bin/pint --dirty --format agent` before finalizing PHP changes. Pint is enforced in CI and via pre-commit hook.
 - **Tinker:** `php artisan tinker --execute '...'` — single quotes to prevent shell expansion. Prefer `database-query`/`database-schema` Boost MCP over raw SQL.
 - **Artisan:** New migrations use `YYYY_MM_DD_000001_description.php` (sequential daily counter); pass `--no-interaction`.
 - **Frontend rebuild:** After frontend changes run `npm run build` (or `vite build`).
+- **JS lint/format:** `npm run lint` + `npm run format` after touching `resources/js/`.
 
 ### Composer Scripts
 ```bash
 composer test         # ensure-test-app-key (only if .env.testing has none) + config:clear + route:clear + XDEBUG_MODE=off php artisan test
-composer verify       # .env existence check, then scripts/verify.sh (preflight + APP_KEY guard + view:clear + pint --test + phpstan + the suite)  ← run before push
-composer verify tests/Feature/TodoLivewireTest.php   # same gates, only the tests you name
+composer verify       # FULL gates: preflight + APP_KEY + view:clear + pint --test + phpstan + suite  ← run before push
+composer verify tests/Feature/TodoLivewireTest.php   # same FULL gates; only the *test* step is narrowed
+composer verify:fast <path>   # local TDD loop: Pint on <path> only, PHPStan skipped — NOT CI-equivalent
 composer dev          # concurrently: php artisan serve + queue:listen + npm run dev
 composer pint         # Pint --dirty --format agent (auto-staged PHP)
 composer phpstan      # phpstan analyse --no-progress
@@ -131,7 +132,7 @@ codegraph status .
 
 ### CI/CD
 
-`.github/workflows/test.yml` runs on PRs with **seven** jobs — three blocking (`lint` Pint, `test` Pest + coverage ≥80%, `phpstan`) and four `continue-on-error` (`coverage-report`, `typecheck`, `e2e`, `test-php86`); an eighth job, `mutation`, is manual-only behind `workflow_dispatch` (#1012). The job table + the yq derivation commands: [testing](docs/agents/testing.md). Coverage is CI-only.
+`.github/workflows/test.yml` runs on PRs with **twelve** jobs — nine blocking (`lint`, `js-lint`, `test`, `js-typecheck`, `e2e`, `csp-enforcing`, `smoke`, `mutation`, `phpstan`) and three `continue-on-error` (`coverage-report`, `typecheck`, `test-php86`). Job table + yq derivations: [testing](docs/agents/testing.md). Coverage is CI-only.
 
 ---
 

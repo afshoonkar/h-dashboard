@@ -6,6 +6,10 @@
 | Split out of `AGENTS.md` on 2026-10-16; that file keeps the one-line rules and
 | the map of where each topic lives.
 
+## Activity log payload contract (issue #1400)
+
+`ActivityLogService::write()` is the single insert path (`log()`/`logAs()` call it; `created()`/`deleted()`/`login()`/`logout()`/`updated()` call `log()`). Callers pass **explicit allowlisted deltas**, never a raw model array (`getAttributes()`, `getChanges()`, `toArray()`) and never a national code/phone/email inside `description` — it is stored and rendered verbatim. `write()` strips `DENIED_KEYS` (passwords and tokens, `n_code`/`kod_melli`/`phone`/`email`, `birth_date`/`hire_date`) from both value sets, recursively, lowercased. A payload with only denied keys is stored as `[]`. The strip is forward-only: rows already in `activity_logs` / `activity_log_archives` are untouched, and a direct `ActivityLog::create()` bypasses it — which is why the service is the only allowed write path.
+
 ## Dead Routes & Components Removed (Phase 4)
 
 These components and routes were removed — do not recreate:
@@ -33,7 +37,7 @@ These components and routes were removed — do not recreate:
 - Button is a plain `<a href="{{ route('units.export') }}">` in `resources/views/livewire/units/index.blade.php` — **Livewire cannot return file downloads**, so never `wire:click` it.
 - Files: `app/Exports/UnitsExport.php`, `app/Http/Controllers/Api/UnitsExportController.php`, tests in `tests/Feature/UnitsExportTest.php`.
 
-> ✅ **`descendantIds` uses `UNION`, not `UNION ALL`** — deliberate. The set operator dedupes, so a `parent_id` cycle terminates (2ms) instead of hanging the connection (proven: `UNION ALL` on a cycle runs until `statement_timeout`). Do not "optimize" it back to `UNION ALL`. The export's own `buildHierarchy()` guards its upward walk separately.
+> ✅ **`descendantIds` uses `UNION`, not `UNION ALL`** — deliberate. The set operator dedupes, so a `parent_id` cycle terminates (2ms) instead of hanging the connection (proven: `UNION ALL` on a cycle runs until `statement_timeout`). Do not "optimize" it back to `UNION ALL`. The export's upward walk is guarded separately by `UnitAncestry` (below).
 
 ### Personnel Export (issue #729, columns #755)
 
@@ -41,7 +45,7 @@ These components and routes were removed — do not recreate:
 
 - **Exports the filtered result**, not the whole table — search and every active filter are reapplied server-side, so what you download is what you were looking at.
 - **12 columns:** `کد ملی`, `نام`, `نام خانوادگی`, `نام کامل`, `سمت`, `تحصیلات`, `نوع استخدام`, `ردیف سازمانی`, `واحد سازمانی`, `وضعیت`, **`تاریخ تولد`**, `تاریخ استخدام`. «تاریخ تولد» was added in #755 — `birth_date`/`hire_date` had **no cast** and were returning raw strings, so the export would have printed unformatted values.
-- The unit column carries the **full breadcrumb** via `UnitTreeService::ancestorChain()` — the same contract as the units export's «مسیر کامل».
+- The unit column carries the **full breadcrumb** via `UnitAncestry::chain()` over a memoised `id => [name, parent_id]` index (`unitsById()`, one units query per export, none per row or chunk) — the same contract as the units export's «مسیر کامل».
 - **Relations are eager-loaded in the controller** (`semat`, `tahsil`, `estekhdam`, `radif`, `unit`) so mapping a row never queries. An empty scope uses `whereRaw('1 = 0')`, not a raw empty `IN ()`.
 - Same plain-`<a>` rule: Livewire cannot return file downloads.
 - Files: `app/Exports/PersonsExport.php`, `app/Http/Controllers/Api/PersonsExportController.php`, `tests/Feature/PersonsExportTest.php`, e2e `tests/e2e/personnel/list.spec.ts`.
@@ -63,7 +67,53 @@ Reuse contract (documented at the top of `tree.blade.php`):
 
 `hr/org-chart` is the reference consumer: it contributes only `livewire/hr/personnel-badge` (count + «خالی») and the personnel detail panel. `hr/org-node.blade.php` is **deleted** — do not recreate it; node markup lives in `unit/tree-node.blade.php`. The search box and expand/collapse buttons live INSIDE `unit.tree` because they drive the child's own state — a parent cannot call a child's methods without a ref. A second consumer (e.g. covered population per unit) needs zero tree code: a badge view + an event listener.
 
-`UnitTreeService::ancestorChain()` is the **shared breadcrumb walker** — the personnel export's unit path and the tree UI resolve hierarchy through it. The units export is the exception: `UnitsExportController` walks its own `hierarchyMap()` / `buildHierarchy()` (see the note above). Do not re-implement an upward walk anywhere else.
+`UnitTreeService::ancestorChain()` is the tree UI's breadcrumb walker, and every upward walk runs through the same helper — see below. Do not re-implement an upward walk anywhere else.
+
+### One ancestor walk (issue #1302)
+
+`App\Support\UnitAncestry` is the only walk over `parent_id`. DB-free, one operation:
+`chain(int $unitId, array $index, ?array $accessibleIds, int $maxDepth = MAX_DEPTH): list<array{id, name}>`
+— root-first, excluding the unit itself. `$index` is `id => [name, parent_id]`. Scope has exactly
+one meaning: **`null` = explicitly unlimited, `[]` = in scope of nothing, an array = the parent
+must be a member and is then named.** A cycle, self-parent, parent missing from the index,
+out-of-scope parent or `MAX_DEPTH = 100` cuts the chain **silently** — no throw, no marker in the
+payload. `$visited` is seeded with the unit itself; the cap is a safety net for a corrupt linear
+chain (the real dev depth is 6). `inScope()` is public so an adapter decides "is this parent worth
+loading?" from the same predicate instead of a second copy.
+
+Adapters, all keeping their public shape:
+
+- `UnitTreeService::ancestorChain()` — scope-checked; it tests `parent_id` **before** touching
+  `->parent`, so an out-of-scope parent is never loaded. An eager chain costs 0 queries and only
+  the documented seventh hop costs one (`UnitTreeServiceTest` pins the 7/0/1 counts).
+- `UnitsExportController::buildHierarchy()` — presenter only: unlimited scope over the full
+  `hierarchyMap()` (which includes inactive units), then shapes `path/depth/parent_name`.
+  Ancestors above the caller's scope are named on purpose.
+- `PersonsExport::resolveUnitPath()` — calls the helper directly with `null` scope.
+
+On corrupt `parent_id` (self-parent, A↔B cycle) the units export now names each unit once:
+`"A"`/depth 0 and `"B > A"`/1, where the old walk repeated the unit (`"A > A"`, `"A > B > A"`).
+Acyclic paths are unchanged; do not "restore" the repeat.
+
+**Downward (descendant) walks — current contract:**
+
+- `OrgChartController::orgChart()` — #1350 guard: per-path visited set seeded with each root, the
+  `UnitAncestry::MAX_DEPTH` (100) cap, and a silent cut. A repeated edge is dropped from `children`;
+  nothing is thrown and no marker is emitted, so acyclic payloads and child order are unchanged.
+- `OrgChartController::loadSubtree()` — same #1350 guard: the requested unit is seeded as visited and
+  `format()` drops repeats and depth-cap hits. The flat `Unit::subtree()` CTE is independently safe
+  (`UNION` dedupes). Acyclic payload/order unchanged.
+- `Unit::buildTree()` — #1350 guard on `$attachChildren` (per-path visited, `MAX_DEPTH`, silent cut),
+  pinned by `tests/Feature/UnitModelTest.php`.
+- `UnitsExportController::orderDepthFirst()`/`walk()` — the one remaining downward hole. Root-less
+  cycles are saved by the orphan-append at `orderDepthFirst():136-143` (`reject` the walk's `seen`
+  set, then ascending id), which is unchanged; cycles reachable from a root are guarded by this fix
+  (#1367): each stack branch carries its own visited path and depth, so the walk terminates, a
+  repeated node is dropped, and acyclic ordering is identical. `walk` is not dead code (the ordering
+  uses it).
+- `unit.tree`'s `collectAllIds()` — the protected Livewire method at
+  `resources/views/livewire/unit/tree.blade.php:330-355` (not a `UnitTreeService` method; no
+  `UnitTreeService::collectAllIds()` exists), with a global visited set; descendant direction, safe.
 
 ### Batched child loading (issue #722)
 
@@ -178,14 +228,18 @@ Heavy operations are dispatched as queued jobs. All implement `ShouldQueue` with
 | `ArchiveActivityLogsJob` | 300s | 3 | Deletes activity logs older than N days |
 | `CleanNotificationsJob` | 300s | 3 | Deletes notifications older than N days |
 | `GenerateDailyReportsJob` | 600s | 2 | Runs `GenerateDailyReports` artisan command — **not dispatched by anything** (see the gotcha below); the 06:00 schedule runs the command inline (#1021) |
+| `ImportHardwareJob` | 600s | 1 | Hardware XLSX import on `redis-reports`. One attempt: a partially applied run cannot be replayed without duplicating rows (`hardwares` has no unique key on the compare column). One import per user at a time (#1194) |
+| `ImportPersonsJob` | 600s | 1 | Personnel XLSX import on `redis-reports`. Same one-attempt, one-per-user contract as `ImportHardwareJob` |
 | `SyncZabbixJob` | 30s | 2 | Fetches Zabbix interface traffic, caches it as `zabbix_traffic_data` (5 min TTL); records a `zabbix_sync_logs` row per run (#740) |
 | `SendNotificationJob` | 30s | 3 | Queued wrapper for one in-app notification, **per recipient**; dispatched only from `TicketCommentController` (comment create/update/delete). Not unit-scoped |
 
-The two retention jobs accept a `$unitIds` array; **empty resolves `AccessService::allUnitIds()` (org-wide), NOT `accessibleUnitIds()`** (#836). `accessibleUnitIds()` reads `auth()`/`session()` and is therefore always `[]` in a scheduler or queue worker — every caller used to read that as "nothing to do" and exit successfully. `accessibleUnitIds()` is request-scoped UI code only. `GenerateDailyReportsJob` takes no scope of its own: it shells out to `reports:generate-daily`, which resolves the unit set itself. Those jobs have `failed()` methods that `Log::error()`. `SyncZabbixJob` takes no unit scope and records a **failure row** when `services.zabbix.out_item_id` / `in_item_id` are not configured.
+The two retention jobs accept a `$unitIds` array; **empty resolves `AccessService::allUnitIds()` (org-wide), NOT `accessibleUnitIds()`** (#836). `accessibleUnitIds()` reads `auth()`/`session()` and is therefore always `[]` in a scheduler or queue worker — every caller used to read that as "nothing to do" and exit successfully. `accessibleUnitIds()` is request-scoped UI code only. `GenerateDailyReportsJob` takes no scope of its own: it shells out to `reports:generate-daily`, which resolves the unit set itself. Those jobs have `failed()` methods that `Log::error()`. `SyncZabbixJob` takes no unit scope and records a **failure row** when a fetch returns a failed result, as well as when `services.zabbix.out_item_id` / `in_item_id` are not configured.
 
-> Gotcha: `GenerateDailyReportsJob` has **no dispatch site on purpose**. Its `$timeout` is 600s while the default `redis` connection's `retry_after` is 90s, so a dispatched run can be re-reserved and executed twice — it writes rows. `config/queue.php` already defines `redis-reports` (`retry_after` 600) for it, but the documented worker (`install-guid.md`) only serves the default `redis` connection, so dispatching it there would silently stop generating daily reports. Pin the connection + worker (issue #1010) before wiring this job into `bootstrap/app.php` (#1021).
+> Gotcha: `GenerateDailyReportsJob` has **no dispatch site on purpose** — the 06:00 schedule runs `reports:generate-daily` inline (#1021). The queue pin is **already in place** (#1010, closed by PR #1130): the job carries `#[Connection('redis-reports')]` (`app/Jobs/GenerateDailyReportsJob.php:18`), whose `retry_after` is 660s against its 600s `$timeout`; `install-guid.md` §11 documents the `h-dashboard-queue-reports` worker that consumes the `redis-reports` connection (`queues:reports` list); and `tests/Feature/Jobs/JobsTest.php:285-295` pins the connection invariant (`test_long_running_jobs_pin_the_connection_scoped_to_them`), with the dispatch side at `:246`. What is still unsafe is dispatching it into a deployment running only the default `redis` worker — `queues:reports` would have no consumer. Confirm the reports worker is enabled before wiring `->job(new GenerateDailyReportsJob)` into `bootstrap/app.php`.
 
-> Gotcha: `NotificationService::send()` is the **static** primitive — it creates the in-app notification row and invalidates the recipient's bell cache. `SendNotificationJob` is only the queued per-recipient wrapper around it and has **no static `send()` of its own** (its surface is `__construct` / `handle` / `failed`). `SyncZabbixJob::alertAdmins()` calls `NotificationService::send()` **directly and synchronously** — it does not dispatch the job. Read both before adding a second notification path.
+> Gotcha: `NotificationService::send()` is the **static** primitive — it creates the in-app notification row and invalidates the recipient's bell cache. `SendNotificationJob` is only the queued per-recipient wrapper around it and has **no static `send()` of its own** (its surface is `__construct` / `handle` / `failed`). Read both before adding a second notification path.
+
+> Gotcha: the optional `$dedupeKey` on `NotificationService::send()` is the **event identity, not a content hash** — retries/duplicates of one event pass the same key, different events pass different keys; a second send with the same `(user_id, dedupe_key)` returns the existing row (backed by the `notifications_user_dedupe_key_unique` index). Today only `SendNotificationJob` passes one (`job:{queue uuid}`).
 
 ---
 
@@ -196,11 +250,13 @@ The two retention jobs accept a `$unitIds` array; **empty resolves `AccessServic
 | Scheduled item | Schedule |
 |---|---|
 | `cache:prune-stale` | hourly |
-| `todos:generate-recurring` | daily 02:00 |
-| `maintenance:generate-due` | daily 03:00 |
-| `data:archive` | weekly (Mon 04:00) |
+| `todos:generate-recurring` | daily 02:00, `->withoutOverlapping(60)` |
+| `maintenance:generate-due` | daily 03:00, `->withoutOverlapping(60)` |
+| `data:archive` | weekly (Mon 04:00), `->withoutOverlapping(120)` + in-command lock |
 | `reports:generate-daily` | daily 06:00, `->withoutOverlapping()` |
 | `SyncZabbixJob` (queued, **not** the `zabbix:sync` command) | `everyFiveMinutes()`, `->withoutOverlapping()` |
+
+**Lock expiry is explicit on the three writers (#1305)** — the `withoutOverlapping()` default of 1440 minutes is the entire interval of a daily run, so a crashed run would hold the lock right up to the next start. `data:archive` also takes `Cache::lock('command:data:archive', 6h)` inside `ArchiveOldRecords`, because the schedule lock is only read on the `Schedule::run()` path and a manual `php artisan data:archive` would otherwise race it. There is no `--force` flag: an emergency manual run releases the lock with `Cache::lock('command:data:archive', 1)->forceRelease()`.
 
 `zabbix:sync` (plan 018) is **no longer scheduled** — the schedule dispatches `SyncZabbixJob` instead, so a slow Zabbix API can never block the scheduler. Run `php artisan zabbix:sync` manually when you need the command.
 
@@ -211,11 +267,35 @@ The two retention jobs accept a `$unitIds` array; **empty resolves `AccessServic
 
 `CacheInvalidationService` uses driver-agnostic version-counter invalidation: cache keys are `{namespace}:v{version}:{scopeHash}:{extra}`, and a write bumps the counter. Hot paths use `Cache::remember(...)` with the versioned key.
 
-**Key namespaces:** `hardware_stats`, `gis`, `maps`, `dashboard`, `hr_stats`, `unit_hierarchy`, `report_units`, `report_todos`, `report_tickets`, `calendar`, `global_search`, **`zabbix_devices`** (added with issue #698).
+**Key namespaces:** all **19** in `PruneStaleCache::NAMESPACES` (`grep -n 'NAMESPACES' -A2 app/Console/Commands/PruneStaleCache.php`) — `hardware_stats`, `gis`, `maps`, `dashboard`, `hr_stats`, `report_todos`, `report_tickets`, `report_persons`, `report_units`, `unit_hierarchy`, `calendar`, `zabbix_devices` (added with issue #698), `global_search`, `disease_maps`, `activity_log`, `report_no_boundary`, `unit_types`, `tools_stats`, `notifications`.
+
+**The version key comes from the service and nowhere else.** A cache key is built with `remember()`/`cacheKey()` and a version read with `getVersion()`; a hand-written `Cache::get('…_version')` (or a literal `…:v{$v}`) bypasses invalidation and reads a counter nobody bumps (#1290). `tests/Feature/CacheVersionKeyGuardTest.php` enforces this over `app/` and `resources/views/`, and also pins that every namespace literal at a call site — plus the `*Namespaces` lists in `AppServiceProvider` — is registered here.
 
 `PruneStaleCache::NAMESPACES` is the **single source of truth** — that exact `const` array lists every versioned namespace, and a new namespace must be added there so the audit and the tests see it. Since #981, `cache:prune-stale` is an honest **version audit**: it reports versions and deletes nothing — stale versioned keys become unreachable after a bump and expire by TTL, and `CacheInvalidationService::increment()` does not depend on this `const`.
 
 > Performance patterns, caching strategies, and optimization details: `references/api-endpoints.md` (Performance section).
+
+## maryUI component mirrors (#1480)
+
+`AppServiceProvider::boot()` re-registers seven maryUI aliases to app-owned components in `app/View/Components/` — accessibility (#957), CSP-safe Alpine (#1352), or both. Each mirror copies the vendor `render()` heredoc plus a **declared transform**: the ordered ops in `MaryUiMirrorTest::MIRRORS` are applied to the vendored heredoc and the result must be line-identical to the mirror's heredoc. `AppBrand` is the only app heredoc with no vendor counterpart, declared in `NON_MIRRORS`. A structural difference (an inline `x-data` literal replaced by a named factory plus `data-*`) is legal only for a removing op backed by `js_requires` literals in `resources/js/mary-components.js` — the test checks the attributes and the factory's `dataset` reads in both directions.
+
+| Blade alias | App component | Vendor class (locked mary 2.9.10) | Alpine factory | Contract delta | Introduced by |
+|---|---|---|---|---|---|
+| `table` | `CspTable` | `Table.php` | `maryTable` | `<th>` gains `aria-sort`/`tabindex`/two `@keydown`; `@entangle` literal → factory + 3 `data-*`; two `\|\|` → ternaries | #957, #1352 |
+| `menu-item` | `AccessibleMenuItem` | `MenuItem.php` | — | 3-line `aria-current` guard before the href block | #957 |
+| `main` | `CspMain` | `Main.php` | `marySidebar` | `x-data` literal → factory + 3 `data-*`; `@menu-sub-clicked` handler | #1352 |
+| `menu-sub` | `CspMenuSub` | `MenuSub.php` | `maryMenuSub` | `x-data` literal → factory + `data-show` | #1352 |
+| `modal` | `CspModal` | `Modal.php` | `maryModal` | `@entangle`/`x-init`/`:class`/Escape block → factory + 2 `data-*`; close buttons drop their `$wire` writes | #1352, #1469 |
+| `choices-offline` | `CspChoicesOffline` | `ChoicesOffline.php` | `maryChoices` | outer `{focused, selection}` literal removed; inner literal → factory + 10 `data-*`; options JSON `<script>`; `x-html` slot → plain-JS copy; four expressions → methods | #1352 |
+| `file` | `CspFile` | `File.php` | `maryFile` | `@entangle` literal → factory + 4 `data-*`; `x-on:livewire-upload-progress` listener dropped; three `&&` → ternaries; `:style` template literal → `progressStyle()` | #1352 |
+
+**Re-sync checklist after any `robsontenorio/mary` upgrade:**
+
+1. Run `composer test -- --filter='MaryUiMirrorTest'` — never upgrade mary and trust a suite you did not re-run.
+2. Each failure names the mirror and the first divergent line; a vendor line with no op is markup maryUI changed.
+3. Edit the mirror to match — or add the op to `MIRRORS` when the change is deliberate — and update `js_requires` if a factory literal moved.
+4. Confirm `git diff phpstan-baseline.neon` adds **0** entries and `composer verify -- tests/Feature/MaryUiMirrorTest.php` is green.
+5. Update the locked version in this table, then `view:clear` → `view:cache` on deploy.
 
 ## Gotchas (transplanted from the former `## Gotchas Quick Reference`)
 
@@ -224,7 +304,7 @@ The two retention jobs accept a `$unitIds` array; **empty resolves `AccessServic
 | `route('tickets.show')` | Does not exist — use `route('tickets.inbox')` |
 | Todo calendar | Must use `@script` block (not inline JS) for wire:navigate compatibility |
 | Person search | 500ms debounce applied — do not remove, causes Livewire update floods |
-| A typed Livewire model parameter binds by **route key**, not by `id` (#936) | A parameter like `delete(PersonModel $person)` is resolved by Livewire through `resolveRouteBinding()`, i.e. by the model's `getRouteKeyName()`. `Person` overrides it to **`n_code`** — the API deliberately depends on this (`routes/api.php` `{person}` binds by `n_code`), so it must stay — while a Blade call site almost always writes `{{ $model->id }}`. The two disagree, `resolveRouteBinding(3)` runs `WHERE n_code = '3'`, matches nothing, and throws `ModelNotFoundException` **before the method body runs**: every authorize/scope check in that method is dead code, and the request 404s. `Person` is the **only** model in `app/Models/` with a custom `getRouteKeyName()`, so the other 11 typed-model Livewire parameters (`units`, `users`, `hardware`, `roles`, `permissions`, `maintenance`, the four kargozini lookup tables, `zabbix-devices`) all resolve correctly today — each pairs with a `->id` call site on a model whose route key *is* `id` — but nothing stops a second custom route key. **Prefer `int $id` + `findOrFail($id)`** (the `editPerson($id)` style) so the value the browser sends is the value the query uses. Two traps if you must route-key it: (1) `wire:click="delete({{ $person->n_code }})"` interpolates **unquoted**, so the browser parses `0023548258` as a JS numeric literal and strips the leading zeros (V8: `d(0023548258) === 23548258`) — a real convention in Iranian national codes; (2) passing a hydrated model to `->call('delete', $fresh)` in a test **skips implicit binding entirely** (`ImplicitlyBoundMethod` skips anything already `instanceof` the class), so such a test passes against the broken code. Assert on the **database**, never on component status — Livewire's test broker allow-lists `ModelNotFoundException` in `withoutExceptionHandling` (`RequestBroker.php:30`), so the failure is swallowed and a green test can delete nothing. Pinned by the `#936` block in `tests/Feature/Kargozini/PersonLivewireTest.php` |
+| A typed Livewire model parameter binds by **route key**, not by `id` (#936) | A parameter like `delete(PersonModel $person)` is resolved by Livewire through `resolveRouteBinding()`, i.e. by the model's `getRouteKeyName()`. `Person` overrides it to **`n_code`** — the API deliberately depends on this (`routes/api.php` `{person}` binds by `n_code`), so it must stay — while a Blade call site almost always writes `{{ $model->id }}`. The two disagree, `resolveRouteBinding(3)` runs `WHERE n_code = '3'`, matches nothing, and throws `ModelNotFoundException` **before the method body runs**: every authorize/scope check in that method is dead code, and the request 404s. `Person` is the **only** model in `app/Models/` with a custom `getRouteKeyName()`, so the other 11 typed-model Livewire parameters (`units`, `users`, `hardware`, `roles`, `permissions`, `maintenance`, the four kargozini lookup tables, `zabbix-devices`) all resolve correctly today — each pairs with a `->id` call site on a model whose route key *is* `id` — but nothing stops a second custom route key. **Prefer `int $id` + `findOrFail($id)`** (the `editPerson($id)` style) so the value the browser sends is the value the query uses. Two traps if you must route-key it: (1) `wire:click="delete({{ $person->n_code }})"` interpolates **unquoted**, so the browser parses `0023548258` as a JS numeric literal and strips the leading zeros (V8: `d(0023548258) === 23548258`) — a real convention in Iranian national codes; (2) passing a hydrated model to `->call('delete', $fresh)` in a test **skips implicit binding entirely** (`ImplicitlyBoundMethod` skips anything already `instanceof` the class), so such a test passes against the broken code. Assert on the **database**, never on component status — Livewire's test broker allow-lists `ModelNotFoundException` in `withoutExceptionHandling` (`vendor/livewire/livewire/src/Features/SupportTesting/RequestBroker.php:30`), so the failure is swallowed and a green test can delete nothing. Pinned by the `#936` block in `tests/Feature/Kargozini/PersonLivewireTest.php` |
 | Toast auto-dismiss | Default 5s timeout; `timeout: 0` means never dismiss |
 | `hr/org-node.blade.php` removed | Replaced by `unit/tree-node.blade.php` (issue #704). Tests split: `UnitTreeLivewireTest` (generic tree contract) + `HrOrgChartPageTest` (the HR page embedding it) |
 | `ORDER BY` + `LIMIT` = oldest N, not newest | `groupBy('day')->orderBy('day')->limit(30)` returns the **oldest** 30 days, because ORDER BY is applied before LIMIT (issue #734, dashboard ticket-trend chart). To show the most recent N buckets, take them in a subquery and re-sort for display: `DB::query()->fromSub($inner->orderByDesc('day')->limit(30), 'daily')->orderBy('day')->get()`. Flipping only the outer `orderBy` reverses the axis — do not "fix" it that way. The axis is deliberately **sparse** (30 most recent days *that have data*, not 30 consecutive days), so an E2E assertion of "30 consecutive days" fails against correct code |

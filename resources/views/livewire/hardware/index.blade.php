@@ -56,8 +56,6 @@ return new class extends Component
 
     public bool $showForm = false;
 
-    public bool $showEditModal = false;
-
     public bool $showFilters = false;
 
     public bool $showColPanel = false;
@@ -306,7 +304,6 @@ return new class extends Component
         $this->resetForm();
         $this->editingId = null;
         $this->showForm = false;
-        $this->showEditModal = false;
     }
 
     public function startCreate(): void
@@ -314,7 +311,6 @@ return new class extends Component
         $this->resetValidation();
         $this->resetForm();
         $this->editingId = null;
-        $this->showEditModal = false;
         $this->showForm = true;
     }
 
@@ -373,7 +369,6 @@ return new class extends Component
         $this->clean_at = $hw->clean_at?->format('Y-m-d');
         $this->selectedPersonName = $hw->person ? trim($hw->person->f_name.' '.$hw->person->l_name) : null;
         $this->showForm = false;
-        $this->showEditModal = true;
     }
 
     public function updateHardware(): void
@@ -555,26 +550,28 @@ return new class extends Component
             return;
         }
 
-        // #1026: write the audit BEFORE the mass delete. A mass delete fires no
-        // model `deleting` event, so without this the devices vanish with no
-        // trail and never reach the trash. Same writer and shape as the API.
-        app(HardwareBulkAuditWriter::class)->batchInsertAudits(
-            $hardwares,
-            'bulk_delete',
-            null,
-            fn (Hardware $hw) => HardwareAuditChange::deletionSnapshot($hw)
-        );
-
         $scopedIds = $hardwares->pluck('id')->all();
 
+        // #1026: a mass delete fires no model `deleting` event, so the audit must
+        // be written manually — but only AFTER the delete succeeds to avoid
+        // phantom rows on failure (Issue #1362). Same writer and shape as the API.
         // Suppress the per-model observer during the mass delete so each device
         // gets one `bulk_delete` row, not a duplicate `deleted` one. try/finally
         // mirrors HardwareController::bulkDelete().
         request()->attributes->set('suppress_audit', true);
         try {
-            Hardware::whereIn('id', $scopedIds)->delete();
+            $count = Hardware::whereIn('id', $scopedIds)->delete();
         } finally {
             request()->attributes->remove('suppress_audit');
+        }
+
+        if ($count > 0) {
+            app(HardwareBulkAuditWriter::class)->batchInsertAudits(
+                $hardwares,
+                'bulk_delete',
+                null,
+                fn (Hardware $hw) => HardwareAuditChange::deletionSnapshot($hw),
+            );
         }
 
         // #1026: parity with the API path — listeners on HardwareUpdated and the
@@ -711,10 +708,3 @@ return new class extends Component
     </x-card>
 </div>
 
-@script
-<script>
-    Livewire.on('download-export', (url) => {
-        window.location.href = url;
-    });
-</script>
-@endscript

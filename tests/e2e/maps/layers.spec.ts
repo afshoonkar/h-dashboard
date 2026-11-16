@@ -106,6 +106,16 @@ test.describe('maps — issue #769 marker zoom after filter toggle', () => {
       zoomanim: ((window as any).Alpine.store('map').get()._events?.zoomanim || []).length,
     }));
 
+    // #776/#1481: filtering is client-side from the published block, so a
+    // toggle must not round-trip. A `POST /livewire/update` here means the
+    // marker set went back through the Livewire snapshot.
+    const livewireUpdates: string[] = [];
+    page.on('request', (req) => {
+      if (req.method() === 'POST' && new URL(req.url()).pathname.includes('/livewire/update')) {
+        livewireUpdates.push(req.url());
+      }
+    });
+
     await page.locator('.controls-panel input[type="checkbox"]').first().check();
     await page.waitForFunction(
       (n) => document.querySelectorAll('#map .leaflet-marker-icon').length !== n,
@@ -113,6 +123,8 @@ test.describe('maps — issue #769 marker zoom after filter toggle', () => {
       { timeout: 30000 },
     );
     await page.waitForTimeout(1000);
+
+    expect(livewireUpdates, '#776: a filter toggle must re-render locally, never round-trip').toHaveLength(0);
 
     const after = await page.evaluate(() => {
       const map = (window as any).Alpine.store('map').get();
@@ -175,5 +187,59 @@ test.describe('maps — issue #769 marker zoom after filter toggle', () => {
     expect(moved.total).toBeGreaterThan(50);
     expect(moved.movedCount).toBeGreaterThan(moved.total * 0.9);
     expect(errors.filter((m) => m.includes('_latLngToNewLayerPoint'))).toHaveLength(0);
+  });
+});
+
+test.describe('maps — issue #1386 layer/filter dispatch + SPA carry', () => {
+  test.beforeEach(async ({ page }) => {
+    await login(page);
+    await page.goto('/map');
+    await page.waitForLoadState('networkidle');
+    await page.waitForTimeout(2500);
+  });
+
+  test('toggling the hardware layer updates the layers query param', async ({ page }) => {
+    await page.getByRole('button', { name: /سخت‌افزار/ }).click();
+    await page.waitForFunction(
+      () => new URL(window.location.href).searchParams.get('layers')?.includes('hardware'),
+      { timeout: 10000 },
+    );
+    expect(new URL(page.url()).searchParams.get('layers')).toContain('hardware');
+  });
+
+  test('changing the hardware filter updates filter_hardware', async ({ page }) => {
+    await page.getByRole('button', { name: /سخت‌افزار/ }).click();
+    await page.waitForSelector('select[x-model="filters.hardware_type"]', {
+      state: 'visible',
+      timeout: 10000,
+    });
+    await page.locator('select[x-model="filters.hardware_type"]').selectOption('laptop');
+    await page.waitForFunction(
+      () => new URL(window.location.href).searchParams.get('filter_hardware') === 'laptop',
+      { timeout: 10000 },
+    );
+    expect(new URL(page.url()).searchParams.get('filter_hardware')).toBe('laptop');
+  });
+
+  test('wire:navigate away and back carries the query string', async ({ page }) => {
+    await page.getByRole('button', { name: /سخت‌افزار/ }).click();
+    await page.waitForFunction(
+      () => new URL(window.location.href).searchParams.get('layers')?.includes('hardware'),
+      { timeout: 10000 },
+    );
+    const toggled = new URL(page.url()).searchParams.get('layers');
+
+    // The ticket menu is a collapsed <details>; its links are clipped out of
+    // the layout tree until the group is open, so click the summary first.
+    await page.locator('details > summary:has-text("مدیریت تیکت‌ها")').first().click();
+    await page.waitForTimeout(500);
+    await page.locator('a:has-text("تیکت جدید")').first().click();
+    await page.waitForURL('**/tickets/new**', { timeout: 15000 });
+
+    await page.goto(`/map?layers=${toggled}`);
+    await page.waitForLoadState('networkidle');
+    await page.waitForTimeout(2500);
+
+    expect(new URL(page.url()).searchParams.get('layers')).toBe(toggled);
   });
 });

@@ -631,10 +631,18 @@ class PersonImport implements ToCollection, WithCustomCsvSettings, WithHeadingRo
         $cache = app(CacheInvalidationServiceInterface::class);
         $cache->increment('hr_stats');
         $cache->increment('dashboard');
+        // #1351: the bulk path fires no model events, so the manual block
+        // must bump `report_persons` itself, or a bulk import leaves the
+        // cached persons report stale until the TTL expires.
+        $cache->increment('report_persons');
 
         if ($this->touchesMapScope) {
             $cache->increment('maps');
             $cache->increment('gis');
+            // Issue #1347: same gate as maps/gis — the import writes persons
+            // without model events, so the manual block must bump
+            // `unit_hierarchy` too.
+            $cache->increment('unit_hierarchy');
         }
     }
 

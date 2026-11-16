@@ -3,6 +3,8 @@
 use App\Http\Controllers\Api\HardwareExportController;
 use App\Http\Controllers\Api\PersonsExportController;
 use App\Http\Controllers\Api\UnitsExportController;
+use App\Http\Controllers\BackupController;
+use App\Http\Controllers\TicketAttachmentController;
 use App\Models\User;
 use App\Services\ActivityLogService;
 use Illuminate\Http\Request;
@@ -50,14 +52,6 @@ Route::post('/logout', function () {
     if ($userId) {
         ActivityLogService::logout('خروج از سیستم - کاربر: '.$userName);
         Session::forget("user_{$userId}_display_name");
-
-        // Revoke the map page's token only (issue #840). Its plaintext sits in
-        // the rendered HTML, so it must not stay valid after the session ends.
-        // Deliberately NOT `$user->tokens()->delete()`: that would also kill the
-        // `flutter-app` mobile token, which is a separate product decision.
-        // The name mirrors `TOKEN_NAME` on the `map.map-dashboard` component;
-        // `MapDashboardTest` pins the two against each other.
-        $user->tokens()->where('name', 'map-dashboard')->delete();
     }
 
     auth()->logout();
@@ -66,13 +60,6 @@ Route::post('/logout', function () {
 
     return redirect('/');
 })->name('logout');
-
-// Test route for SafeRoleOrPermission middleware
-if (app()->isLocal() || app()->environment('testing')) {
-    Route::middleware('safe_role_or_permission:test-permission')->get('/test-safe-route', function () {
-        return response('OK', 200);
-    })->name('test.safe-route');
-}
 
 // Protected routes here
 Route::middleware('auth')->group(function () {
@@ -190,6 +177,12 @@ Route::middleware('auth')->group(function () {
             Route::middleware('role_or_permission:view_assigned_tickets')->group(function () {
                 Route::livewire('/inbox', 'tickets.inbox')->name('inbox');
             });
+            // Issue #1276 — attachments moved to the private `local` disk, so the
+            // only way to read one is this authenticated, unit-scoped route.
+            // `auth` + `unit_context` are inherited from the enclosing groups.
+            Route::get('/{ticket}/attachments/{attachment}', [TicketAttachmentController::class, 'show'])
+                ->middleware('role_or_permission:view_assigned_tickets|view_all_tickets')
+                ->name('attachments.download');
         });
 
         Route::middleware('role_or_permission:manage_users')->group(function () {
@@ -240,4 +233,27 @@ Route::middleware('auth')->group(function () {
             Route::livewire('/tools', 'tools.tools')->name('tools');
         });
     }); // unit_context
+});
+
+// Issue #1375 — بک‌آپ و بازگردانی جداول.
+//
+// این گروه عمداً بیرون از گروه `auth`/`unit_context` بالا و «خودش» با
+// `auth` + `role:admin` بسته شده است: یک بک‌آپ کلِ یک جدول را می‌گیرد، نه
+// ردیف‌های یک واحد، پس «متنِ واحد» نباید جلویش را بگیرد.
+//
+// دانلود یک GET ساده است: Livewire نمی‌تواند فایل برگرداند، پس دکمه‌ها
+// `<a href>` هستند (نه `wire:click`) و پاسخ یک `BinaryFileResponse` است.
+Route::middleware(['auth', 'role:admin'])->group(function () {
+    Route::get('/tools/backup/full', [BackupController::class, 'full'])
+        ->name('backup.full');
+    Route::get('/tools/backup/table/{table}', [BackupController::class, 'table'])
+        ->name('backup.table');
+});
+
+// #1377 — the backup page (Livewire) is admin-only too, but it lives in its
+// OWN group: a backup covers a WHOLE table, not the rows of one unit, so
+// the `unit_context` group must not gate it. The download routes above stay
+// where they are (they are plain GETs, not Livewire).
+Route::middleware(['auth', 'role:admin'])->group(function () {
+    Route::livewire('/tools/backup', 'backup.index')->name('backup');
 });

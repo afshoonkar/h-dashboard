@@ -1,4 +1,4 @@
-import { test, expect, login } from '../shared/fixtures';
+import { test, expect, login, waitForLivewire } from '../shared/fixtures';
 
 /**
  * Plan 008 — Hardware audit trail (history modal)
@@ -21,16 +21,42 @@ test.describe('hardware audit trail', () => {
   test('history modal opens with title and content', async ({ page }) => {
     // Scope to the DESKTOP table (mobile cards are md:hidden and not clickable).
     const historyBtn = page.locator('div.hidden.md\\:block button[wire\\:click*="loadHistory"]').first();
+    const history = waitForLivewire(page);
     await historyBtn.click();
-    await page.waitForTimeout(1000);
+    await history;
 
     await expect(page.locator('body')).toContainText('تاریخچه تغییرات');
     await expect(page.locator('body')).toContainText(/تاریخچه‌ای ثبت نشده است|ایجاد|ویرایش|حذف/);
   });
 
+  test('history modal × closes and persists the closed state', async ({ page }) => {
+    const historyBtn = page.locator('div.hidden.md\\:block button[wire\\:click*="loadHistory"]').first();
+    const opened = waitForLivewire(page);
+    await historyBtn.click();
+    await opened;
+
+    // /hardware also renders an always-present (closed) help dialog from
+    // _toolbar.blade.php, so scope by title instead of a bare `dialog.modal`.
+    const modal = page.locator('dialog.modal', { hasText: 'تاریخچه تغییرات' });
+    await expect(modal).toHaveClass(/modal-open/);
+
+    const closed = waitForLivewire(page);
+    await modal.locator('.modal-box > form[method="dialog"] button').click();
+    await closed;
+    await expect(page.locator('dialog.modal.modal-open')).toHaveCount(0);
+
+    // Reopening proves showHistoryModal really became false (audit-modal.blade.php
+    // renders under @if), not just that the dialog lost its class.
+    const reopened = waitForLivewire(page);
+    await historyBtn.click();
+    await reopened;
+    await expect(page.locator('dialog.modal', { hasText: 'تاریخچه تغییرات' })).toHaveClass(/modal-open/);
+  });
+
   test('history modal shows action filter chips', async ({ page }) => {
+    const history = waitForLivewire(page);
     await page.locator('div.hidden.md\\:block button[wire\\:click*="loadHistory"]').first().click();
-    await page.waitForTimeout(1000);
+    await history;
     for (const chip of ['همه', 'ایجاد', 'ویرایش', 'حذف', 'بازگردانی']) {
       await expect(page.locator('body')).toContainText(chip);
     }
@@ -38,8 +64,9 @@ test.describe('hardware audit trail', () => {
 
   test('rollback restores field and logs rollback entry', async ({ page }) => {
     // Hardware id 4 (AB-17SH-EZDEVAJ) has updated/rollback audits → rollback buttons render.
+    const search = waitForLivewire(page);
     await page.locator('input[placeholder*="جستجو"]').first().fill('AB-17SH-EZDEVAJ');
-    await page.waitForTimeout(1500);
+    await search;
     await expect(page.locator('table tbody tr')).toHaveCount(1);
 
     await page.locator('div.hidden.md\\:block button[wire\\:click*="loadHistory"]').first().click();
@@ -53,8 +80,9 @@ test.describe('hardware audit trail', () => {
     await expect(page.locator('.toast').first()).toContainText('بازگردانده شد', { timeout: 10000 });
 
     // The rollback action itself is logged — filter to بازگردانی and expect an entry.
+    const rollbackFilter = waitForLivewire(page);
     await page.locator('button[wire\\:click="filterHistory(\'rollback\')"]').first().click();
-    await page.waitForTimeout(1500);
+    await rollbackFilter;
     await expect(page.locator('body')).toContainText('بازگردانی');
   });
 });

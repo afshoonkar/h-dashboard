@@ -4,10 +4,10 @@ on:
   pull_request:
     branches: [main, beta, test]
   # The `mutation` job below runs on PRs too (re-enabled 2026-10-25,
-  # reversing the manual-only gate from #1012): it runs in parallel under
-  # E2E's ~30-minute shadow and gates nothing (`continue-on-error: true`).
-  # A manual run executes every job, so read the mutation job's own result,
-  # not the run's overall conclusion.
+  # reversing the manual-only gate from #1012) and blocks since #1502
+  # (`--min=41`): it runs in parallel with E2E, so while green it adds no
+  # wall time. A manual run executes every job, so read the mutation job's
+  # own result, not the run's overall conclusion.
   workflow_dispatch:
 
 concurrency:
@@ -29,6 +29,28 @@ jobs:
         with:
           php-version: '8.5'
           tools: composer:latest
+
+      # Issue #1506. No CI step audited the dependencies, so an advisory
+      # affecting a reachable runtime path surfaced only on a machine where
+      # somebody remembered to run `composer audit`. It runs before
+      # `composer install` because `--locked` needs only composer.lock — no
+      # dependency code, script or plugin executes first — and it runs in
+      # `lint` for the same reason the APP_KEY guard below does: that is the
+      # cheapest blocking job, so a vulnerable lock fails a PR in seconds.
+      #
+      # The script, not the exit code, decides: `composer audit` exits 1 for an
+      # advisory AND for a hard error (invalid lock, unreachable advisory DB),
+      # and its `--ignore-severity` filter never matches a null severity
+      # (Composer applies it only to string severities) and accepts an unknown
+      # value silently. critical/high/null block; medium/low are reported.
+      - name: 'Audit PHP dependencies (blocking: critical/high)'
+        run: |
+          set +e
+          composer audit --locked --format=json --no-interaction --abandoned=report > composer-audit.json
+          status=$?
+          set -e
+          if [ "$status" -gt 1 ]; then exit "$status"; fi
+          php scripts/dependency-audit-gate.php composer-audit.json
 
       - name: Cache Composer download cache
         uses: actions/cache@v5
@@ -56,8 +78,49 @@ jobs:
       - name: Assert no tracked env file commits an APP_KEY
         run: php scripts/check-app-key-leak.php
 
+      - name: Assert .env.example ships the Persian locale
+        # Issue #1414: the canonical dev template must agree with the four
+        # sibling env templates, or a fresh clone boots English in an RTL app.
+        run: |
+          grep -q '^APP_LOCALE=fa' .env.example
+          grep -q '^APP_FALLBACK_LOCALE=en' .env.example
+
       - name: Check code style
         run: vendor/bin/pint --test
+
+  js-lint:
+    name: JS Lint & Format (ESLint + Prettier)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      # Issue #1506 — the JS half of the dependency gate. `--package-lock-only`
+      # reads package-lock.json and works without node_modules, so this runs
+      # before `npm ci`. npm's `--audit-level=high` IS the policy on this side:
+      # it sets the failure threshold and still prints moderate/low, and npm has
+      # no null severity (Composer spells the report-only tier `medium`, npm
+      # `moderate`).
+      - name: 'Audit JS dependencies (blocking: high/critical)'
+        run: npm audit --package-lock-only --audit-level=high
+
+      - name: Install dependencies
+        # `npm ci` also proves package.json and package-lock.json agree.
+        run: npm ci
+
+      - name: Lint resources/js
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
 
   test:
     name: Tests & Coverage
@@ -122,14 +185,7 @@ jobs:
       # or the built bundle — the build was never asserted on, only paid for.
       # The `e2e` job still builds: it drives a real browser.
       - name: Copy .env for testing
-        run: |
-          cp .env.example .env.testing
-          # Match the CI service containers (postgres: postgres/secret/h_dashboard_test, redis: no password).
-          # CACHE_STORE must be non-shared: Laravel 13 reads CACHE_STORE (not the legacy
-          # CACHE_DRIVER in .env.example); leaving it on redis shares spatie's permission
-          # cache between parallel test processes and cross-pollutes their separate DBs.
-          sed -i 's/^DB_DATABASE=.*/DB_DATABASE=h_dashboard_test/; s/^DB_USERNAME=.*/DB_USERNAME=postgres/; s/^DB_PASSWORD=.*/DB_PASSWORD=secret/; s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=/; s/^QUEUE_CONNECTION=.*/QUEUE_CONNECTION=sync/' .env.testing
-          grep -q '^CACHE_STORE=' .env.testing || echo 'CACHE_STORE=array' >> .env.testing
+        run: bash scripts/build-env-testing.sh
 
       - name: Generate application key
         run: php artisan key:generate --env=testing
@@ -297,17 +353,53 @@ jobs:
         # above is what keeps the workflow run green (issue #865/#867 pattern).
         run: npm run typecheck
 
+  js-typecheck:
+    name: Typecheck (resources/js ratchet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        # Also the lock-file consistency check (same reason as :283-285).
+        run: npm ci
+
+      - name: Typecheck the resources/js @ts-check set
+        # Not wrapped in `|| true`: a regression in an opted-in file must render
+        # this job red and visible.
+        run: npx tsc -p tsconfig.js.json --noEmit
+
+      - name: Every resources/js file must opt in
+        run: test -z "$(grep -L '^// @ts-check' resources/js/*.js)"
+
   e2e:
     name: E2E Tests (Playwright)
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-    # Non-blocking ramp (issue #867): the suite has never run in CI, so the
-    # first executions will surface real latent failures (the inert
-    # waitForLivewire() wait, the self-skipping unit-map-boundary spec).
-    # Ship continue-on-error:true now; promote to required only after two
-    # consecutive green runs AND the two collateral fixes land (separate PRs,
-    # preconditions for required status — see #867's git review).
-    continue-on-error: true
+    # #1352: the cap is 45 per the owner's 2026-11-03 decision — attempt 2
+    # of the rebased head was cancelled at the 35-minute cap (35:26), while
+    # attempt 1 finished green inside 35. Supersedes D8's return-to-35.
+    timeout-minutes: 45
+    # Non-blocking ramp (issue #867, redefined in #1469): the job stays
+    # green, but the assert step below is red whenever a test failed, was
+    # flaky, or never ran — so `continue-on-error` no longer hides the truth.
+    #
+    # COUNTER DEFINITION (machine-readable, #1469): two CONSECUTIVE `e2e`
+    # runs where failed == 0 AND flaky == 0 AND did_not_run == 0, read from
+    # the JSON artifact (e2e-results.json) — NOT from the job conclusion,
+    # which is always `success` while continue-on-error is on.
+    # Current counter: ONE — run 43397351827 (job 131791429148, this PR's
+    # head) measured 0 failed / 0 flaky / 0 did not run. Run #1466 measured
+    # 5 failed / 2 flaky / 6 did not run. The second precondition (the two
+    # collateral fixes land in separate PRs) is unchanged — see #867's git
+    # review.
 
     services:
       postgres:
@@ -426,41 +518,319 @@ jobs:
         # libraries — do not make this step conditional on cache-hit.
         run: npx playwright install --with-deps chromium
 
-      - name: Run E2E suite (list reporter proves execution)
+      - name: Run E2E suite (list + JSON reporters)
         # Through scripts/e2e-test.sh ONLY — never bare `npx playwright test`:
         # fixtures.ts needs tests/e2e/.run-state.json, which only this script
         # writes (migrate:fresh → pwd user → serve :8001 → test → restore).
         # The script swaps .env, so it must NEVER run in parallel with
-        # anything (not concurrency-safe). --reporter=list makes the log
-        # itself the proof that tests executed; the count assertion below
-        # turns the #865 trap (green with zero tests) into a hard failure.
-        # Output is tee'd to e2e-list.log so the next step can count real
-        # executions from the reporter stream itself.
-        run: bash scripts/e2e-test.sh --reporter=list 2>&1 | tee e2e-list.log
-
-      - name: Assert tests really executed
-        # A green job that executed zero tests is a failure, not a pass.
-        # The list reporter prints one line per executed test; the summary
-        # line looks like "  202 passed (3.5m)". Both must be present.
+        # anything (not concurrency-safe).
+        #
+        # `set -o pipefail` (#1469 §5a): without it the step's exit code was
+        # `tee`'s, so a red suite exited 0 and the job looked green even
+        # before `continue-on-error` entered the picture. The script already
+        # propagates Playwright's exit code; pipefail lets that reach the step.
+        #
+        # The JSON reporter (#1469 §5b) is the machine-readable source the next
+        # step reads: combined with `--reporter=list` Playwright suppresses the
+        # per-test `✓` lines (measured on 1.65), which is why the old
+        # `grep -cE '✓'` guard was replaced by JSON counts. `tee` keeps a human
+        # log and the artifact keeps the JSON.
         run: |
-          EXECUTED=$(grep -cE '✓|✔|passed \(' e2e-list.log || true)
-          echo "e2e executed-test lines: ${EXECUTED}"
-          grep -qE '[0-9]+ passed' e2e-list.log
+          set -o pipefail
+          PLAYWRIGHT_JSON_OUTPUT_NAME=e2e-results.json \
+            bash scripts/e2e-test.sh --reporter=list --reporter=json 2>&1 | tee e2e-list.log
+
+      - name: Report E2E results (failed / flaky / did-not-run)
+        # #1469 §5: the job is `continue-on-error: true` (#867), so its
+        # conclusion is always `success` — this step is the visible truth.
+        # It reads Playwright's own JSON counts, writes the table to the job
+        # summary, annotates every failed test with file+line, and exits
+        # non-zero when failed > 0, flaky > 0, or did_not_run > 0 (a serial
+        # group that swallowed the tests behind a failure).
+        #
+        # `if: always()` so it still runs when the suite step died early; the
+        # script itself fails loudly when the JSON/log is missing, which keeps
+        # the #865 zero-tests guard ("green with no tests is red").
+        if: always()
+        run: php scripts/e2e-report.php e2e-results.json e2e-list.log
+
+      - name: Upload E2E report
+        # The counter in the `continue-on-error` comment above is defined from
+        # this artifact, not from the job conclusion. `if: always()` so a red
+        # or crashed run is diagnosable too.
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-results
+          path: |
+            e2e-results.json
+            e2e-list.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  csp-enforcing:
+    name: CSP Enforcing Gate (csp.spec.ts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Gate 2 (#1352, decision الف): a SEPARATE, BLOCKING job — no
+    # `continue-on-error` (unlike the `e2e` job above, which stays
+    # non-blocking per #867). It runs tests/e2e/security/csp.spec.ts and
+    # tests/e2e/settings/browser-notifications.spec.ts with CSP_ENFORCING=true:
+    # the specs detect enforcing mode from the `content-security-policy`
+    # header and demand zero enforced violations.
+    # Flipping the whole suite to enforcing is the rollout step (Finding F1),
+    # not this gate. This job must be added to the branch's required status
+    # checks (admin) for the "blocking" part to bite — the workflow alone
+    # cannot require itself.
+
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: h_dashboard_e2e
+        options: >
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:latest
+        options: >
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: pgsql, redis, pcntl, bcmath, zip, curl, mbstring
+          tools: composer:latest
+
+      - name: Cache Composer download cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/composer/files
+          key: composer-${{ runner.os }}-${{ hashFiles('composer.lock') }}
+          restore-keys: |
+            composer-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Build frontend assets
+        run: |
+          npm ci
+          npm run build
+
+      - name: Copy .env for the app (CI services)
+        run: |
+          cp .env.example .env
+          # CI services: postgres/postgres/secret + passwordless redis.
+          # This .env feeds BOTH the app and scripts/build-env-e2e.sh, which
+          # copies APP_KEY/DB_PASSWORD/REDIS_PASSWORD into .env.e2e without
+          # ever printing the values.
+          sed -i 's/^DB_USERNAME=.*/DB_USERNAME=postgres/; s/^DB_PASSWORD=.*/DB_PASSWORD=secret/; s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=/' .env
+          php artisan key:generate --force
+
+      - name: Build .env.e2e (secret-safe)
+        run: |
+          bash scripts/build-env-e2e.sh
+          sed -i -E 's/^((REDIS_PASSWORD|DB_PASSWORD|DB_USERNAME)=.*)<[^>]*>(.*)/\1\3/; s/^((REDIS_PASSWORD|DB_PASSWORD|DB_USERNAME)=)[[:space:]]*$/\1/' .env.e2e
+          grep -qE '^[^#]*<[^>]*>' .env.e2e && { echo "leftover <...> placeholder in .env.e2e"; exit 1; } || true
+
+      - name: Flip CSP_ENFORCING=true for this gate only
+        # Gate 2 (#1352, C3): the flip step the plan requires — it did not
+        # exist before this job. It touches the GENERATED .env.e2e only;
+        # .env.e2e.example stays `false`, so every other run stays
+        # report-only. Placed after the Build-.env.e2e step by design.
+        run: sed -i 's/^CSP_ENFORCING=.*/CSP_ENFORCING=true/' .env.e2e && grep -q '^CSP_ENFORCING=true' .env.e2e
+
+      - name: Assert APP_LOCALE=fa in .env.e2e
+        run: grep -q '^APP_LOCALE=fa' .env.e2e
+
+      - name: Verify the isolated e2e database exists
+        run: PGPASSWORD=secret psql -h 127.0.0.1 -U postgres -d h_dashboard_e2e -c "SELECT 1;"
+
+      - name: Cache Playwright chromium (issue #1067)
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run CSP specs in enforcing mode (list reporter proves execution)
+        # Through scripts/e2e-test.sh ONLY (see the `e2e` job's comment).
+        # --timeout=120000: the specs walk 8 pages with networkidle waits;
+        # it took 29.5s on a slow local VM, so the 30s default is marginal
+        # even before CI variance. The timeout is harness headroom, not a
+        # spec change.
+        run: |
+          set -o pipefail
+          bash scripts/e2e-test.sh tests/e2e/security/csp.spec.ts tests/e2e/settings/browser-notifications.spec.ts --timeout=120000 --reporter=list 2>&1 | tee csp-gate-list.log
+
+      - name: Assert the gate specs really executed
+        run: |
+          EXECUTED=$(grep -cE '✓|✔|passed \(' csp-gate-list.log || true)
+          echo "csp gate executed-test lines: ${EXECUTED}"
+          grep -qE '[0-9]+ passed' csp-gate-list.log
+          grep -q 'tests/e2e/settings/browser-notifications.spec.ts' csp-gate-list.log
+          test "${EXECUTED}" -gt 0
+          if grep -q '✘' csp-gate-list.log; then echo "CSP gate: failing tests present in csp-gate-list.log"; exit 1; fi
+
+  smoke:
+    name: Smoke Tests (actions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # BLOCKING job (owner decision 2026-11-08): the ten main journeys in
+    # tests/e2e/smoke/actions-smoke.spec.ts must pass for a PR to merge — no
+    # `continue-on-error` (unlike the `e2e` job, which stays non-blocking per
+    # #867). It runs ONLY the smoke spec, so it adds ~2 minutes, not the
+    # full suite's ~30. This job must be added to the branch's required
+    # status checks (admin) for the "blocking" part to bite — the workflow
+    # alone cannot require itself (same caveat as `csp-enforcing` above).
+
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: h_dashboard_e2e
+        options: >
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:latest
+        options: >
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: pgsql, redis, pcntl, bcmath, zip, curl, mbstring
+          tools: composer:latest
+
+      - name: Cache Composer download cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/composer/files
+          key: composer-${{ runner.os }}-${{ hashFiles('composer.lock') }}
+          restore-keys: |
+            composer-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Build frontend assets
+        run: |
+          npm ci
+          npm run build
+
+      - name: Copy .env for the app (CI services)
+        run: |
+          cp .env.example .env
+          # CI services: postgres/postgres/secret + passwordless redis.
+          # This .env feeds BOTH the app and scripts/build-env-e2e.sh, which
+          # copies APP_KEY/DB_PASSWORD/REDIS_PASSWORD into .env.e2e without
+          # ever printing the values.
+          sed -i 's/^DB_USERNAME=.*/DB_USERNAME=postgres/; s/^DB_PASSWORD=.*/DB_PASSWORD=secret/; s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=/' .env
+          php artisan key:generate --force
+
+      - name: Build .env.e2e (secret-safe)
+        run: |
+          bash scripts/build-env-e2e.sh
+          sed -i -E 's/^((REDIS_PASSWORD|DB_PASSWORD|DB_USERNAME)=.*)<[^>]*>(.*)/\1\3/; s/^((REDIS_PASSWORD|DB_PASSWORD|DB_USERNAME)=)[[:space:]]*$/\1/' .env.e2e
+          grep -qE '^[^#]*<[^>]*>' .env.e2e && { echo "leftover <...> placeholder in .env.e2e"; exit 1; } || true
+
+      - name: Assert APP_LOCALE=fa in .env.e2e
+        run: grep -q '^APP_LOCALE=fa' .env.e2e
+
+      - name: Verify the isolated e2e database exists
+        run: PGPASSWORD=secret psql -h 127.0.0.1 -U postgres -d h_dashboard_e2e -c "SELECT 1;"
+
+      - name: Cache Playwright chromium (issue #1067)
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run smoke suite (list reporter proves execution)
+        # Through scripts/e2e-test.sh ONLY (see the `e2e` job's comment).
+        # --workers=1: the suite is 10 tests / ~2 minutes sequential; the
+        # local parallel-workers flake (sidebar.spec.ts) is not worth
+        # re-proving here. --timeout=60000: OSM tile requests can hang and
+        # eat the 30s default on the map legs (seen locally on #1391).
+        run: bash scripts/e2e-test.sh tests/e2e/smoke/actions-smoke.spec.ts --workers=1 --timeout=60000 --reporter=list 2>&1 | tee smoke-list.log
+
+      - name: Assert the smoke suite really executed
+        run: |
+          EXECUTED=$(grep -cE '✓|✔|passed \(' smoke-list.log || true)
+          echo "smoke executed-test lines: ${EXECUTED}"
+          grep -qE '[0-9]+ passed' smoke-list.log
           test "${EXECUTED}" -gt 0
 
   mutation:
     name: Mutation Testing
     # Runs on every PR (re-enabled 2026-10-25, reversing the manual-only
-    # gate from #1012): each run is expensive (checkout, composer install
-    # and migrations before the single `pest --mutate` line below, ~30
-    # minutes as of 2026-10-28), but it runs in parallel with E2E and
-    # gates nothing (`continue-on-error: true`), so it adds no wall time.
+    # gate from #1012) and blocks since #1502: each run is expensive
+    # (checkout, composer install and migrations before the single
+    # `pest --mutate` line below, ~30 minutes as of 2026-10-28), but it
+    # runs in parallel with E2E, so while it is green it adds no wall time.
+    # `--min=41` is a ratchet on the measured beta floor (41.84%,
+    # 359/858 mutants on 46f9cbc): raise it as coverage lands, never lower
+    # it without an open tracking issue.
     # Cap 45 minutes (raised from 30 on 2026-10-28 after the job hit the
     # 30-minute timeout on #1270 and #1271).
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # Non-blocking: the score is informational and gates nothing.
-    continue-on-error: true
+    # Blocking: a score below the threshold fails this job and the PR.
 
     services:
       postgres:
@@ -519,14 +889,7 @@ jobs:
       # or the built bundle — the build was never asserted on, only paid for.
       # The `e2e` job still builds: it drives a real browser.
       - name: Copy .env for testing
-        run: |
-          cp .env.example .env.testing
-          # Match the CI service containers (postgres: postgres/secret/h_dashboard_test, redis: no password).
-          # CACHE_STORE must be non-shared: Laravel 13 reads CACHE_STORE (not the legacy
-          # CACHE_DRIVER in .env.example); leaving it on redis shares spatie's permission
-          # cache between parallel test processes and cross-pollutes their separate DBs.
-          sed -i 's/^DB_DATABASE=.*/DB_DATABASE=h_dashboard_test/; s/^DB_USERNAME=.*/DB_USERNAME=postgres/; s/^DB_PASSWORD=.*/DB_PASSWORD=secret/; s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=/; s/^QUEUE_CONNECTION=.*/QUEUE_CONNECTION=sync/' .env.testing
-          grep -q '^CACHE_STORE=' .env.testing || echo 'CACHE_STORE=array' >> .env.testing
+        run: bash scripts/build-env-testing.sh
 
       - name: Generate application key
         run: php artisan key:generate --env=testing
@@ -536,9 +899,10 @@ jobs:
 
       - name: Run mutation tests
         # @covers declarations scope mutations to tested code.
-        # No --min threshold: the job is informational (continue-on-error: true)
-        # and reports the mutation score without blocking PRs.
-        run: ./vendor/bin/pest --mutate --parallel --covered-only
+        # `--min=41` is a ratchet on the measured beta floor (41.84% on
+        # 46f9cbc, #1502). The `=` is load-bearing: a bare `--min 41` is
+        # swallowed by Pest's coverage plugin, the gate never arms.
+        run: ./vendor/bin/pest --mutate --parallel --covered-only --min=41
 
   phpstan:
     name: PHPStan Static Analysis
@@ -573,6 +937,14 @@ jobs:
           composer validate --strict --check-lock
           git diff --exit-code -- composer.lock
 
+      # Larastan boots bootstrap/app.php through the console kernel, so the
+      # analysed app needs an encryption key even though no test runs here.
+      # Q3(b) of #1433: only this job gets an .env; no services, no database.
+      - name: Provide an application key for the kernel boot
+        run: |
+          cp .env.example .env
+          php artisan key:generate --force
+
       - name: Run PHPStan
         run: vendor/bin/phpstan analyse --no-progress
 
@@ -581,8 +953,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Informational only: PHP 8.6 is pre-release (RC3 2026-10-08, GA 2026-11-19).
-    # Same precedent as the mutation job — never blocks a merge; it surfaces
-    # 8.6 incompatibilities and deprecations while there is still time to fix them.
+    # It never blocks a merge; it surfaces 8.6 incompatibilities and
+    # deprecations while there is still time to fix them.
     continue-on-error: true
 
     services:
@@ -625,16 +997,21 @@ jobs:
         uses: actions/cache@v5
         with:
           path: vendor
-          key: composer-${{ hashFiles('composer.lock') }}
-          restore-keys: composer-
+          key: composer-vendor-${{ runner.os }}-${{ hashFiles('composer.lock') }}
+          restore-keys: |
+            composer-vendor-${{ runner.os }}-
 
       - name: Install dependencies
-        # The lock predates PHP 8.6: three packages cap php at 8.5 — nette/schema
-        # and nette/utils (both on the production path, via league/commonmark) plus
-        # brianium/paratest (dev) — so a plain install cannot even resolve on 8.6,
-        # with or without dev dependencies. The preview installs the locked packages
-        # anyway — surfacing real 8.6 behaviour is the job's whole point. This flag
-        # exists ONLY in this job; it carries production weight, not just tooling.
+        # The *locked* versions cap php at 8.5: brianium/paratest v7.20.0
+        # (~8.3.0 || ~8.4.0 || ~8.5.0, dev) is the only one left — nette/schema
+        # v1.4.0 (8.1 - 8.6) and nette/utils v4.1.6 (8.2 - 8.6) cleared with the
+        # #1506 lock refresh — so a plain install cannot resolve on 8.6, with or
+        # without dev dependencies. The preview installs the locked packages
+        # anyway — surfacing real 8.6 behaviour is the job's whole point. Drop the
+        # flag once a plain install resolves on 8.6: brianium/paratest needs
+        # >=7.25.0 (~8.4.0 || ~8.5.0 || ~8.6.0) and that pulls phpunit ^13.3.4
+        # (pest 5) — a test-stack major, not a bump. This flag exists ONLY in this
+        # job.
         run: composer install --prefer-dist --no-interaction --no-progress --ignore-platform-req=php
 
       # Issue #1185: no Node, no Vite build. `Tests\TestCase::setUp()` calls
@@ -642,14 +1019,7 @@ jobs:
       # or the built bundle — the build was never asserted on, only paid for.
       # The `e2e` job still builds: it drives a real browser.
       - name: Copy .env for testing
-        run: |
-          cp .env.example .env.testing
-          # Match the CI service containers (postgres: postgres/secret/h_dashboard_test, redis: no password).
-          # CACHE_STORE must be non-shared: Laravel 13 reads CACHE_STORE (not the legacy
-          # CACHE_DRIVER in .env.example); leaving it on redis shares spatie's permission
-          # cache between parallel test processes and cross-pollutes their separate DBs.
-          sed -i 's/^DB_DATABASE=.*/DB_DATABASE=h_dashboard_test/; s/^DB_USERNAME=.*/DB_USERNAME=postgres/; s/^DB_PASSWORD=.*/DB_PASSWORD=secret/; s/^REDIS_PASSWORD=.*/REDIS_PASSWORD=/; s/^QUEUE_CONNECTION=.*/QUEUE_CONNECTION=sync/' .env.testing
-          grep -q '^CACHE_STORE=' .env.testing || echo 'CACHE_STORE=array' >> .env.testing
+        run: bash scripts/build-env-testing.sh
 
       - name: Generate application key
         run: php artisan key:generate --env=testing

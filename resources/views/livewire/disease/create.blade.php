@@ -11,7 +11,6 @@ use App\Services\PatientService;
 use App\Support\JalaliDateRange;
 use App\Traits\BuildsDiseaseCaseForm;
 use App\Traits\PersianNormalizer;
-use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 use Livewire\Attributes\Computed;
@@ -146,15 +145,28 @@ return new class extends Component
                 'birth_date_jalali' => $this->newPatient['birth_date_jalali'] ?? '',
                 'gender' => $this->newPatient['gender'] ?? '',
             ]);
-        } catch (UniqueConstraintViolationException) {
-            // Race: the row appeared between the lookup and the insert.
-            $existing = $service->findByKodMelli($this->newPatient['kod_melli']);
-            $this->addError(
-                'newPatient.kod_melli',
-                $existing instanceof Patient
-                    ? PatientService::duplicateMessage($existing)
-                    : 'این کد ملی قبلاً ثبت شده است.',
-            );
+        } catch (ValidationException $e) {
+            $errors = $e->errors();
+
+            if (array_key_exists('duplicate', $errors)) {
+                // Race: the row appeared between the lookup and the insert.
+                $existing = $service->findByKodMelli($this->newPatient['kod_melli']);
+
+                $this->addError(
+                    'newPatient.kod_melli',
+                    $existing instanceof Patient
+                        ? PatientService::duplicateMessage($existing)
+                        : (string) ($errors['duplicate'][0] ?? 'این کد ملی قبلاً ثبت شده است.'),
+                );
+
+                return;
+            }
+
+            // Service-side rule violations — same shared rules, re-run over the
+            // normalized copy inside create() (#1300); remapped onto the form.
+            foreach ($errors as $key => $keyMessages) {
+                $this->addError('newPatient.'.((string) $key), array_first($keyMessages) ?? '');
+            }
 
             return;
         }
@@ -408,7 +420,11 @@ return new class extends Component
 }; ?>
 
 <div>
-    <x-header title="ثبت کیس بیماری" separator/>
+    <x-header title="ثبت کیس بیماری" separator>
+        <x-slot:actions>
+            <x-theme-selector/>
+        </x-slot:actions>
+    </x-header>
 
     {{-- Step 1 — patient by national code ───────────────────────────────── --}}
     <x-card shadow>
@@ -448,8 +464,18 @@ return new class extends Component
                         @enderror
                     </div>
 
-                    <x-input label="نام" wire:model="newPatient.first_name" placeholder="نام"/>
-                    <x-input label="نام خانوادگی" wire:model="newPatient.last_name" placeholder="نام خانوادگی"/>
+                    <div>
+                        <x-input label="نام" wire:model="newPatient.first_name" placeholder="نام"/>
+                        @error('newPatient.first_name')
+                            <p class="text-xs text-error mt-1">{{ $message }}</p>
+                        @enderror
+                    </div>
+                    <div>
+                        <x-input label="نام خانوادگی" wire:model="newPatient.last_name" placeholder="نام خانوادگی"/>
+                        @error('newPatient.last_name')
+                            <p class="text-xs text-error mt-1">{{ $message }}</p>
+                        @enderror
+                    </div>
 
                     <div class="form-control">
                         <label class="label" for="disease_patient_birth_date">
@@ -627,43 +653,3 @@ return new class extends Component
     <script src="{{ asset('js/other/jalalidatepicker.min.js') }}"></script>
 @endassets
 
-@script
-<script>
-    // Issue #1182: page-scoped Jalali datepicker. Every date input carries
-    // `data-jdp-model` naming the Livewire property it belongs to, so the same
-    // binding works for the two fixed dates, the patient birth date and any
-    // dynamic date field added by the disease definitions.
-    const initDiseaseCaseJdp = () => {
-        if (typeof jalaliDatepicker === 'undefined') {
-            return;
-        }
-
-        jalaliDatepicker.startWatch({
-            time: false,
-            hasSecond: false,
-            format: 'YYYY/MM/DD',
-            separatorChars: { date: '/', between: ' ', time: ':' },
-        });
-
-        document.querySelectorAll('[data-jdp][data-jdp-model]').forEach(input => {
-            if (!input.dataset.jdpBound) {
-                input.dataset.jdpBound = '1';
-                input.addEventListener('jdp:change', event => {
-                    $wire.set(input.dataset.jdpModel, event.target.value);
-                });
-            }
-
-            // `wire:ignore` keeps the DOM value out of Livewire's hands, so the
-            // server state is mirrored back after every round-trip.
-            const value = $wire.get(input.dataset.jdpModel);
-            if (value !== undefined && value !== null) {
-                input.value = value;
-            }
-        });
-    };
-
-    initDiseaseCaseJdp();
-    document.addEventListener('livewire:navigated', initDiseaseCaseJdp);
-    Livewire.hook('morphed', () => initDiseaseCaseJdp());
-</script>
-@endscript

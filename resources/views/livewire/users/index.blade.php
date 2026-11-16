@@ -372,16 +372,29 @@ return new class extends Component
             'role_ids.required' => 'حداقل یک نقش باید انتخاب شود.',
         ]);
 
-        try {
-            User::create([
-                'n_code' => $this->n_code,
-                'password' => bcrypt($this->password),
-            ]);
+        $passwordHash = bcrypt($this->password);
 
-            $user = User::where('n_code', $this->n_code)->first();
-            $user->roles()->sync($this->role_ids);
-            $user->syncPermissions($this->user_permissions);
-            $user->units()->sync($this->unit_ids);
+        try {
+            // Issue #1277: the user row and its roles/permissions/units are one
+            // write. A failure part-way must not leave a live credential with
+            // no roles behind. `bcrypt` stays outside so hashing (~100ms) does
+            // not extend the transaction.
+            $user = \Illuminate\Support\Facades\DB::transaction(function () use ($passwordHash): User {
+                $user = User::create([
+                    'n_code' => $this->n_code,
+                    'password' => $passwordHash,
+                ]);
+
+                $user->roles()->sync($this->role_ids);
+                $user->syncPermissions($this->user_permissions);
+                $user->units()->sync($this->unit_ids);
+
+                return $user;
+            });
+
+            // Issue #1277: after commit — the cache store is not transactional,
+            // so bumping the version inside the transaction would let a
+            // concurrent reader cache pre-commit data under the new version.
             app(AccessService::class)->clearCache($user);
 
             $this->resetForm();
@@ -433,37 +446,48 @@ return new class extends Component
             'role_ids.required' => 'حداقل یک نقش باید انتخاب شود.',
         ]);
 
+        $passwordChanged = (bool) $this->password;
+        $passwordHash = $this->password ? bcrypt($this->password) : null;
+
         try {
-            $user = User::withTrashed()->findOrFail($this->editing_user_id);
+            // Issue #1277: the profile update, the #1030 token revocation and
+            // the role/permission/unit syncs are one write — a failure after
+            // the password change must not leave a new password with live
+            // tokens. `$passwordChanged` stays outside for the success message.
+            $user = \Illuminate\Support\Facades\DB::transaction(function () use ($passwordChanged, $passwordHash): User {
+                $user = User::withTrashed()->findOrFail($this->editing_user_id);
 
-            if ($user->hasRole('admin') && ! $this->actor()->hasRole('admin')) {
-                abort(403, 'تنها مدیران می‌توانند کاربران مدیر را ویرایش کنند.');
-            }
+                if ($user->hasRole('admin') && ! $this->actor()->hasRole('admin')) {
+                    abort(403, 'تنها مدیران می‌توانند کاربران مدیر را ویرایش کنند.');
+                }
 
-            $data = ['n_code' => $this->n_code];
+                $data = ['n_code' => $this->n_code];
 
-            $passwordChanged = (bool) $this->password;
+                if ($passwordHash !== null) {
+                    $data['password'] = $passwordHash;
+                }
 
-            if ($this->password) {
-                $data['password'] = bcrypt($this->password);
-            }
+                $user->update($data);
 
-            $user->update($data);
+                // Issue #1030: an admin password reset must revoke the target's
+                // Sanctum tokens, exactly like the self-service path
+                // (`auth/changepassword`) already does. Guarded on an
+                // actually-changed password: a plain profile/role edit must not log
+                // the user's devices out. Every token dies (including
+                // `map-dashboard`) so both password-change paths stay in lockstep —
+                // see `docs/agents/api-auth.md`.
+                if ($passwordChanged) {
+                    $user->tokens()->delete();
+                }
 
-            // Issue #1030: an admin password reset must revoke the target's
-            // Sanctum tokens, exactly like the self-service path
-            // (`auth/changepassword`) already does. Guarded on an
-            // actually-changed password: a plain profile/role edit must not log
-            // the user's devices out. Every token dies (including
-            // `map-dashboard`) so both password-change paths stay in lockstep —
-            // see `docs/agents/api-auth.md`.
-            if ($passwordChanged) {
-                $user->tokens()->delete();
-            }
+                $user->roles()->sync($this->role_ids);
+                $user->syncPermissions($this->user_permissions);
+                $user->units()->sync($this->unit_ids);
 
-            $user->roles()->sync($this->role_ids);
-            $user->syncPermissions($this->user_permissions);
-            $user->units()->sync($this->unit_ids);
+                return $user;
+            });
+
+            // Issue #1277: after commit — see createUser().
             app(AccessService::class)->clearCache($user);
 
             $this->resetForm();
@@ -522,12 +546,12 @@ return new class extends Component
                 });
             })
             ->when($this->search, function (Builder $q) {
-                // Fold both the column (CONCAT) and the term for Persian char equivalence.
+                // The column side is the stored folded copy (#1482), so the
+                // predicate is indexable; only the term is folded here.
                 $term = \App\Traits\PersianNormalizer::foldedTerm($this->search);
-                $foldedConcat = \App\Traits\PersianNormalizer::foldSeparatorsSql("CONCAT(f_name, ' ', l_name)");
 
-                $q->whereHas('person', function ($query) use ($term, $foldedConcat) {
-                    $query->whereRaw("{$foldedConcat} LIKE ?", ["%{$term}%"])
+                $q->whereHas('person', function ($query) use ($term) {
+                    $query->where('full_name_folded', 'LIKE', "%{$term}%")
                         ->orWhere('n_code', 'like', "%{$term}%");
                 });
             })
@@ -564,7 +588,6 @@ return new class extends Component
         }
 
         $term = \App\Traits\PersianNormalizer::foldedTerm($this->person_search);
-        $foldedConcat = \App\Traits\PersianNormalizer::foldSeparatorsSql("CONCAT(f_name, ' ', l_name)");
         $accessibleIds = app(AccessService::class)->accessibleUnitIds();
 
         return Person::query()
@@ -578,8 +601,8 @@ return new class extends Component
             ->where(function ($query) use ($accessibleIds) {
                 $query->whereIn('u_id', $accessibleIds);
             })
-            ->where(function ($query) use ($term, $foldedConcat) {
-                $query->whereRaw("{$foldedConcat} LIKE ?", ["%{$term}%"])
+            ->where(function ($query) use ($term) {
+                $query->where('full_name_folded', 'LIKE', "%{$term}%")
                     ->orWhere('n_code', 'like', "%{$term}%");
             })
             ->limit(20)

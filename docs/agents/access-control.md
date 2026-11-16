@@ -16,7 +16,7 @@ Uses **Spatie Permission** package:
   | Spelling | Why it fails open |
   |---|---|
   | `->when($accessibleIds, fn ($q) => …)` | `Conditionable::when()` runs the callback only for a **truthy** value, so `[]` drops the predicate — the #819 leak in five `/reports/*` components |
-  | `if (! empty($accessibleIds)) { $q->whereIn(…); }` | the predicate is simply never added — #839, all **8** sites in `PersonImport` / `HardwareImport` |
+  | `if (! empty($accessibleIds)) { $q->whereIn(…); }` | the predicate is simply never added — #839, all **8** sites in `PersonImport` / `HardwareImport` (as of #839) |
   | `if (! empty($accessibleIds) && ! in_array($id, $accessibleIds)) { reject }` | the **first conjunct is false**, so `&&` short-circuits and the row is **ACCEPTED** — the same bug with extra steps, and the most dangerous spelling because it *looks* like a scope check |
 
   `AccessibleUnitIds()` is legitimately `[]` for an account with no `user_units` row and no `person.u_id`, and such a user is deliberately allowed through `ValidateUnitContext`. **`[]` means "in scope of nothing", never "unrestricted".** Use a plain `->whereIn($column, $accessibleIds)` (or `->accessible($column)`) instead — an empty array compiles to `0 = 1`. The two-`when` form in `UnitsExportController` / `PersonsExportController` (`when($accessibleIds === [], whereRaw('1 = 0'))`) is also correct — but the unconditional one is one condition instead of two that must both stay right.
@@ -38,6 +38,45 @@ Uses **Spatie Permission** package:
   `whereIn(... unitIds())` at all is the same leak this section is about,
   just silent — no fail-open spelling to catch. Read **every** hit; the
   two sweeps together catch the `when`/`empty` shapes **and** absence.
+
+### Guard (issue #1306)
+
+`tests/Feature/ScopeFailOpenGuardTest.php` scans `app/` and `resources/views/livewire/`
+(240 `.php` files today — `find app resources/views/livewire -name '*.php' | wc -l`) and fails CI with `path:line`. Static scan, no database.
+Comments and docblocks are stripped first, so the spellings may still be quoted in
+prose; the guard flags code, not documentation.
+
+It covers **four** groups: `->when($scope, …)` (1), `if (! empty($scope)) { … }` (2),
+`! empty($scope) && ! in_array(…)` (3), and `->when(! empty($scope), …)` (4). The
+fourth is not one of the three documented spellings — it is the same fail-open shape
+wearing an "extra guard" and is kept deliberately.
+
+**Naming contract:** a *scope list* is `$ids` or camelCase ending in `Ids`
+(`$accessibleUnitIds`, `$unitIds`, `$this->accessibleUnitIds()`). Singular
+(`$unitId`) and snake_case (`$this->role_ids`) are user filters and are not matched.
+Keep new scope lists on this contract, or the guard will not see them.
+
+`ALLOWLIST` lives in the guard file, keyed by path with the groups it may match and a
+mandatory `reason`; `test_every_allowlist_entry_still_matches_its_file` removes dead
+entries. It is empty today and must stay that way — a live spelling found at
+implementation time is stop-and-report, not an allowlist entry.
+
+The guard does **not** replace the manual sweeps above: the absent-precondition shape
+(#980) and `resources/views/` outside `livewire/` still need a human read. The
+documented sweep cannot see `$this->…` variables (`[a-zA-Z]*` cannot match `this->`);
+the guard can.
+
+**Known regex gaps** (no live instance today, so the guard is green):
+- The regex treats **every** `…Ids` name as a scope list. Names that are not scope
+  lists (`$userIds`, `$itemIds`, `$unitIds`, `$scopedIds`, `$allowedUnitTypeIds`)
+  would be flagged if wrapped in `! empty(…)`; the contract above names the scope
+  lists, it does not bless every `…Ids`.
+- `if (! empty($ids) && $q->whereIn(…))` (conjunction + `whereIn`, not `in_array`)
+  matches none of the four groups.
+- Spelling 3 needs the variable text to be byte-identical in both conjuncts.
+- Scope lists that miss the `…Ids` contract (`$accessible_ids`, `$allowedUnits`,
+  `$scope`) are not matched, and `resources/views/` outside `livewire/` is not scanned.
+
 - Users see only their own unit's data (plus sub-units via recursive CTE)
 - **`users.index` is unit-scoped (issue #849) — `manage_users` is NOT a global grant.** The whole file avoids every fail-open spelling: no `when($ids, …)`, no `! empty($ids)` — each predicate is an unconditional `whereIn` / `in_array`, so an empty scope is `0 = 1`, never "no filter".
   - `users()` filters with the **disjunction** `person.u_id ∈ scope` **OR** a `user_units` row ∈ scope. Do not copy `activity-log`'s `whereHas('person', …)` verbatim here: alone it hides accounts with no linked person (admin accounts).
@@ -110,7 +149,7 @@ link's visibility in both directions, plus a real `GET` per link.
 
 | Gotcha | Details |
 |---|---|
-| `map-no-boundary`'s early return is load-bearing | Its `when($accessibleIds, …)` at :36 is unreachable because :28 returns `collect()` for `[]` — keep that guard. Beyond the query it also keeps an empty result out of `Cache::remember('report:no_boundary:'.md5(implode(',',$accessibleIds)))`, which for `[]` is `md5('')` — ONE shared cache slot for every empty-scope user |
+| `map-no-boundary`'s early return is load-bearing | Its predicate is now an unconditional `whereIn('id', $accessibleIds)` at :36; the :28 guard is still load-bearing because it keeps an empty result out of `Cache::remember('report:no_boundary:'.md5(''))` — ONE shared cache slot for every empty-scope user |
 | Nested route middleware is **AND**, not OR | `Route::middleware(['a','b'])->group(...)` — and nesting a route inside another permission group — requires **both**. To accept either, use ONE `role_or_permission:a|b` in a group of its own. This bit `/it/networks` + `/it/wireless`: putting them inside the `role_or_permission:map` group re-added `map` and 403'd a `bw`-only user. `php artisan route:list --path=X -v` prints every resolved middleware — read it instead of guessing |
 | Vendor routes registered by a package must be stripped on `booted`, and **from inside a booted hook** | The maryUI `POST /mary/upload` route (#951) is registered by `MaryServiceProvider::boot()` via `loadRoutesFrom()` — no app-side toggle removes it, and it wrote an unvalidated file to a request-chosen disk and folder behind nothing but `auth`. `App\Support\VendorRouteGuard::strip()` removes it from `AppServiceProvider::boot()`. Two non-obvious parts: (1) `route:cache` swaps the router's collection for a `CompiledRouteCollection` whose `match()` reads a flat pre-built index and whose Route objects are rebuilt from `$attributes` on every call — so **mutating a Route does nothing**; the guard rebuilds and recompiles the collection instead (~4 ms, once per process, only while a pre-fix cache is on disk). (2) Routes are populated by booted callbacks (`AppRouteServiceProvider`, and the `require` of the cached file), so the hook is registered from inside another booted callback — a hook added straight from `boot()` runs **before** the vendor route exists and silently strips nothing. Keep `mary.toogle-sidebar` and `mary.spotlight`: `<x-main>` calls the first on every page render |
 | Spatie `canAny` is FALSE for an unknown permission name | `hasAnyPermission(['nosuchperm'])` returns `false` — it does **not** throw `PermissionDoesNotExist`. So a route gated on a permission that is missing from a deployment's DB 403s **every non-admin** (only role bypasses), silently. Before adding a NEW permission to a gate, either seed it everywhere or reuse an existing one — and remember `PermissionSeeder` alone only re-grants the permissions it explicitly lists |

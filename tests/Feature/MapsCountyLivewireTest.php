@@ -20,7 +20,9 @@ use Tests\TestCase;
  * The page has no Livewire interaction at all (no wire:model / wire:click), so
  * the snapshot copy was pure weight. These tests lock the single-publication
  * contract: the geometry reaches the page exactly once, through the map
- * layer, and never through the public component state.
+ * layer, and never through the public component state. Issue #1352 moved the
+ * publication from the `@script` block to an inert JSON block (the `@script`
+ * body cannot execute under the CSP build at all); the contract is unchanged.
  */
 class MapsCountyLivewireTest extends TestCase
 {
@@ -112,12 +114,13 @@ class MapsCountyLivewireTest extends TestCase
         $html = Livewire::test('maps.county')->assertStatus(200)->html();
 
         // The map still needs the geometry: it is published once, through the
-        // `@script` block that feeds the Leaflet layer.
-        $this->assertStringContainsString('allregions', $html);
+        // inert JSON block that feeds the Leaflet layer (issue #1352: the old
+        // `@script` block cannot execute under the CSP build at all).
+        $this->assertStringContainsString('county-regions-data', $html);
         $this->assertSame(
             1,
             substr_count($html, 'MultiPolygon'),
-            'The county geometry must be published exactly once (the map script), not duplicated into the snapshot.'
+            'The county geometry must be published exactly once (the JSON block), not duplicated into the snapshot.'
         );
     }
 
@@ -125,11 +128,33 @@ class MapsCountyLivewireTest extends TestCase
     {
         $region = $this->actingAsUserInRegionWithBoundary();
 
-        // The toggle menu reads the same data as the script block. Moving the
-        // data out of the public state must not empty the menu.
+        // The toggle menu reads the same data as the JSON block. Moving the
+        // data out of the public state must not empty the menu. Issue #1352:
+        // toggles are [data-region-id] divs with click delegation from
+        // #unitMenu (an x-on:click calling the toggleGeoJson global cannot
+        // run under the CSP build), so the pin is the delegation anchor.
         Livewire::test('maps.county')
             ->assertStatus(200)
             ->assertSee($region->name)
-            ->assertSeeHtml('toggleGeoJson('.$region->id.')');
+            ->assertSeeHtml('data-region-id="'.$region->id.'"');
+    }
+
+    // ==================== #1437: region rename invalidates `maps` ====================
+
+    public function test_region_rename_refreshes_the_cached_county_list(): void
+    {
+        $region = $this->actingAsUserInRegionWithBoundary();
+        $old = $region->name;
+
+        // Warm `maps/county` (`county:regions_with_boundaries`).
+        Livewire::test('maps.county')->assertSee($old);
+
+        $region->update(['name' => 'شهرستان تغییر‌یافته']);
+
+        // The row is cached for five minutes: without the `maps` bump the next
+        // mount serves the pre-rename name until the TTL lapses (#1437).
+        Livewire::test('maps.county')
+            ->assertSee('شهرستان تغییر‌یافته')
+            ->assertDontSee($old);
     }
 }
